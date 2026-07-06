@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         dc模拟器
 // @author       hairuiaa+codex
-// @version      1.5.0
+// @version      1.6.0
 // @description  带每日低保、打工、转盘、老虎机、买大小和管理工具的经济插件。
 // @timestamp    1783334400
 // @license      Apache-2.0
@@ -9,13 +9,13 @@
 
 let ext = seal.ext.find('slot-economy');
 if (!ext) {
-  ext = seal.ext.new('slot-economy', 'hairuiaa+codex', '1.5.0');
+  ext = seal.ext.new('slot-economy', 'hairuiaa+codex', '1.6.0');
   seal.ext.register(ext);
 }
 
 try {
     if (seal.ext.unregisterConfig) {
-        seal.ext.unregisterConfig(ext, "无奖权重", "小奖权重", "大奖权重", "21点消息间隔秒", "21点默认下注", "21点最小下注", "21点最大下注");
+        seal.ext.unregisterConfig(ext, "无奖权重", "小奖权重", "大奖权重", "21点消息间隔秒");
     }
 } catch (e) {}
 
@@ -46,6 +46,11 @@ seal.ext.registerIntConfig(ext, "买大小默认下注", 10, "使用 .买大 或
 seal.ext.registerIntConfig(ext, "买大小最小下注", 1, "买大小允许的最小下注金额。");
 seal.ext.registerIntConfig(ext, "买大小最大下注", 1000, "买大小允许的最大下注金额。");
 seal.ext.registerFloatConfig(ext, "买大小返还倍率", 2.0, "买大小买中时的返还倍率，包含本金。");
+seal.ext.registerIntConfig(ext, "21点默认下注", 10, "使用 .21点 或 .bj 时的默认下注金额。");
+seal.ext.registerIntConfig(ext, "21点最小下注", 10, "21点允许的最小下注金额。");
+seal.ext.registerIntConfig(ext, "21点最大下注", 10000, "21点允许的最大下注金额。");
+seal.ext.registerIntConfig(ext, "21点牌副数", 6, "21点使用几副标准扑克牌。");
+seal.ext.registerBoolConfig(ext, "21点庄家软17要牌", false, "开启后，系统庄家软17继续要牌。");
 seal.ext.registerIntConfig(ext, "管理指令最低权限", 100, "使用加钱和一键共产等管理指令所需的最低权限等级，实际不会低于海豹管理员权限 100。");
 
 const SLOT_SYMBOLS = ["☂️", "🍎", "🍑", "🍉", "⑦"];
@@ -962,40 +967,86 @@ function getBigSmallHelpText() {
     ].join("\n");
 }
 
-function getBlackjackRoundKey(groupId) {
+function getLegacyBlackjackRoundKey(groupId) {
     return `blackjackRound:${groupId}`;
 }
 
-function getBlackjackRound(groupId) {
-    const round = storageGetJsonObject(getBlackjackRoundKey(groupId));
-    if (!round || round.groupId !== groupId || !Array.isArray(round.players)) return null;
+function getBlackjackRoundKey(groupId, userId) {
+    return `blackjackRound:v2:${groupId}:${userId}`;
+}
+
+function normalizeBlackjackHand(hand) {
+    const value = hand && typeof hand === "object" ? hand : {};
+    return {
+        cards: Array.isArray(value.cards) ? value.cards : [],
+        bet: Math.max(0, Math.floor(Number(value.bet) || 0)),
+        originalBet: Math.max(0, Math.floor(Number(value.originalBet || value.bet) || 0)),
+        fromSplit: Boolean(value.fromSplit),
+        splitAces: Boolean(value.splitAces),
+        doubled: Boolean(value.doubled),
+        stood: Boolean(value.stood),
+        busted: Boolean(value.busted),
+        surrendered: Boolean(value.surrendered),
+        finished: Boolean(value.finished),
+    };
+}
+
+function getBlackjackRound(groupId, userId) {
+    const round = storageGetJsonObject(getBlackjackRoundKey(groupId, userId));
+    if (!round || round.rulesVersion !== 2 || round.groupId !== groupId || round.userId !== userId) return null;
     if (!Array.isArray(round.deck)) round.deck = createBlackjackDeck();
-    round.players.forEach((player, index) => {
-        if (!Array.isArray(player.hand)) player.hand = [];
-        player.bet = Math.max(0, Math.floor(Number(player.bet) || 0));
-        player.isDealer = index === 0 || player.userId === round.dealerId;
-        player.busted = Boolean(player.busted);
-        player.stood = Boolean(player.stood);
-    });
-    round.pot = getBlackjackPot(round);
+    if (!Array.isArray(round.dealerHand)) round.dealerHand = [];
+    round.hands = Array.isArray(round.hands) ? round.hands.map(normalizeBlackjackHand) : [];
+    round.currentHandIndex = Math.max(0, Math.floor(Number(round.currentHandIndex) || 0));
+    round.insuranceBet = Math.max(0, Math.floor(Number(round.insuranceBet) || 0));
+    round.startedAt = Math.floor(Number(round.startedAt) || Date.now());
+    round.updatedAt = Math.floor(Number(round.updatedAt) || Date.now());
+    round.phase = round.phase || "playing";
     return round;
 }
 
-function setBlackjackRound(groupId, round) {
+function setBlackjackRound(groupId, userId, round) {
     round.updatedAt = Date.now();
-    round.pot = getBlackjackPot(round);
-    storageSetJsonObject(getBlackjackRoundKey(groupId), round);
+    storageSetJsonObject(getBlackjackRoundKey(groupId, userId), round);
 }
 
-function clearBlackjackRound(groupId) {
-    ext.storageSet(getBlackjackRoundKey(groupId), "");
+function clearBlackjackRound(groupId, userId) {
+    ext.storageSet(getBlackjackRoundKey(groupId, userId), "");
+}
+
+function cleanupLegacyBlackjackRound(ctx, msg, groupId) {
+    const key = getLegacyBlackjackRoundKey(groupId);
+    const round = storageGetJsonObject(key);
+    if (!round || round.rulesVersion === 2 || !Array.isArray(round.players)) return false;
+
+    const currency = getStringConfig("货币名", "金币");
+    let refundTotal = 0;
+    for (const player of round.players) {
+        const userId = normalizeUserId(player && player.userId);
+        const bet = Math.max(0, Math.floor(Number(player && player.bet) || 0));
+        if (!userId || bet <= 0) continue;
+        setWallet(userId, getWallet(userId) + bet);
+        refundTotal += bet;
+    }
+    ext.storageSet(key, "");
+    if (refundTotal > 0) {
+        seal.replyToSender(ctx, msg, `已清理旧版多人21点，并退还未结算下注 ${refundTotal}${currency}。`);
+    }
+    return true;
+}
+
+function getBlackjackDeckCount() {
+    return Math.max(1, Math.min(8, getIntConfig("21点牌副数", 6)));
 }
 
 function createBlackjackDeck() {
     const deck = [];
-    for (const suit of BLACKJACK_SUITS) {
-        for (const rank of BLACKJACK_RANKS) {
-            deck.push({ suit, rank, marked: false });
+    const deckCount = getBlackjackDeckCount();
+    for (let index = 0; index < deckCount; index += 1) {
+        for (const suit of BLACKJACK_SUITS) {
+            for (const rank of BLACKJACK_RANKS) {
+                deck.push({ suit, rank, marked: false });
+            }
         }
     }
     return deck;
@@ -1005,18 +1056,22 @@ function resetBlackjackDeck(round) {
     round.deck = createBlackjackDeck();
 }
 
-function dealBlackjackCard(round, player) {
+function dealBlackjackCard(round) {
     if (!Array.isArray(round.deck) || round.deck.length <= 0) resetBlackjackDeck(round);
     const available = round.deck.filter(card => !card.marked);
     if (available.length <= 0) {
         resetBlackjackDeck(round);
-        return dealBlackjackCard(round, player);
+        return dealBlackjackCard(round);
     }
     const card = available[randomInt(available.length)];
     card.marked = true;
-    const dealt = { suit: card.suit, rank: card.rank };
-    player.hand.push(dealt);
-    return dealt;
+    return { suit: card.suit, rank: card.rank };
+}
+
+function dealBlackjackCardToHand(round, cards) {
+    const card = dealBlackjackCard(round);
+    cards.push(card);
+    return card;
 }
 
 function formatBlackjackCard(card) {
@@ -1025,14 +1080,23 @@ function formatBlackjackCard(card) {
 }
 
 function formatBlackjackHand(hand) {
-    if (!Array.isArray(hand) || hand.length <= 0) return "无牌";
-    return hand.map(formatBlackjackCard).join(" ");
+    const cards = Array.isArray(hand) ? hand : hand && hand.cards;
+    if (!Array.isArray(cards) || cards.length <= 0) return "无牌";
+    return cards.map(formatBlackjackCard).join(" ");
 }
 
-function getBlackjackHandValue(hand) {
+function getBlackjackCardPoint(card) {
+    if (!card) return 0;
+    if (card.rank === "A") return 11;
+    if (card.rank === "K" || card.rank === "Q" || card.rank === "J") return 10;
+    return Number.parseInt(card.rank, 10) || 0;
+}
+
+function getBlackjackHandInfo(hand) {
+    const cards = Array.isArray(hand) ? hand : hand && hand.cards;
     let value = 0;
     let aces = 0;
-    for (const card of hand || []) {
+    for (const card of cards || []) {
         if (card.rank === "A") {
             aces += 1;
             value += 11;
@@ -1042,46 +1106,63 @@ function getBlackjackHandValue(hand) {
             value += Number.parseInt(card.rank, 10) || 0;
         }
     }
-    while (value > 21 && aces > 0) {
+    let softAces = aces;
+    while (value > 21 && softAces > 0) {
         value -= 10;
-        aces -= 1;
+        softAces -= 1;
     }
-    return value;
+    return { value, soft: softAces > 0, cards: cards || [] };
 }
 
-function getBlackjackPot(round) {
-    if (!round || !Array.isArray(round.players)) return 0;
-    return round.players.reduce((sum, player) => sum + Math.max(0, Math.floor(Number(player.bet) || 0)), 0);
+function getBlackjackHandValue(hand) {
+    return getBlackjackHandInfo(hand).value;
 }
 
-function findBlackjackPlayer(round, userId) {
-    if (!round || !Array.isArray(round.players)) return null;
-    return round.players.find(player => player.userId === userId) || null;
+function isBlackjackTenCard(card) {
+    return getBlackjackCardPoint(card) === 10;
 }
 
-function getBlackjackDealer(round) {
-    return round && Array.isArray(round.players) ? round.players[0] : null;
+function isNaturalBlackjack(hand) {
+    const cards = hand && hand.cards;
+    if (!Array.isArray(cards) || cards.length !== 2 || hand.fromSplit) return false;
+    return cards.some(card => card.rank === "A") && cards.some(isBlackjackTenCard);
 }
 
-function getBlackjackIdlePlayers(round) {
-    if (!round || !Array.isArray(round.players)) return [];
-    return round.players.filter(player => !player.isDealer);
+function isDealerBlackjack(round) {
+    const cards = round && round.dealerHand;
+    if (!Array.isArray(cards) || cards.length !== 2) return false;
+    return cards.some(card => card.rank === "A") && cards.some(isBlackjackTenCard);
 }
 
-function getBlackjackWaitSeconds() {
-    return Math.max(0, getIntConfig("21点消息间隔秒", 1));
+function shouldDealerHit(round) {
+    const info = getBlackjackHandInfo(round.dealerHand);
+    if (info.value < 17) return true;
+    if (info.value === 17 && info.soft && getBoolConfig("21点庄家软17要牌", false)) return true;
+    return false;
+}
+
+function playBlackjackDealer(round) {
+    while (shouldDealerHit(round)) {
+        dealBlackjackCardToHand(round, round.dealerHand);
+    }
+    round.dealerHoleRevealed = true;
+}
+
+function getBlackjackTotalBet(round) {
+    if (!round || !Array.isArray(round.hands)) return 0;
+    return round.hands.reduce((sum, hand) => sum + Math.max(0, Math.floor(Number(hand.bet) || 0)), 0);
 }
 
 function parseBlackjackBetAmount(text) {
     const currency = getStringConfig("货币名", "金币");
     const raw = String(text || "").trim();
     const defaultBet = Math.max(1, getIntConfig("21点默认下注", 10));
-    const minBet = Math.max(1, getIntConfig("21点最小下注", 1));
-    const maxBet = Math.max(minBet, getIntConfig("21点最大下注", 1000));
+    const minBet = Math.max(1, getIntConfig("21点最小下注", 10));
+    const maxBet = Math.max(minBet, getIntConfig("21点最大下注", 10000));
     const amountText = raw || String(defaultBet);
 
     if (!/^\d+$/.test(amountText)) {
-        return { ok: false, reason: "下注金额必须是数字。\n示例：.bj bet 50" };
+        return { ok: false, reason: "下注金额必须是数字。\n示例：.21点 50" };
     }
     const amount = Number.parseInt(amountText, 10);
     if (!Number.isSafeInteger(amount) || amount <= 0) {
@@ -1099,27 +1180,28 @@ function parseBlackjackBetAmount(text) {
 function getBlackjackHelpText() {
     const currency = getStringConfig("货币名", "金币");
     const defaultBet = Math.max(1, getIntConfig("21点默认下注", 10));
-    const minBet = Math.max(1, getIntConfig("21点最小下注", 1));
-    const maxBet = Math.max(minBet, getIntConfig("21点最大下注", 1000));
+    const minBet = Math.max(1, getIntConfig("21点最小下注", 10));
+    const maxBet = Math.max(minBet, getIntConfig("21点最大下注", 10000));
     return [
-        "21点",
-        ".bj start / .21点 开始：开启牌桌，开局者成为庄家",
-        ".bj join / .21点 加入：加入本群牌桌",
-        ".bj bet 50 / .21点 下注50：下注",
-        ".bj open / .21点 发牌：庄家发牌并锁定加入",
+        "21点个人局",
+        ".21点 50 / .bj 50：下注并立即发牌",
         ".bj hit / .21点 要牌：摸一张牌",
-        ".bj stand / .21点 停牌：结束自己的操作",
-        ".bj status / .21点 状态：查看本局状态",
-        ".bj end / .21点 结束：庄家结束未发牌的牌桌",
+        ".bj stand / .21点 停牌：结束当前手牌",
+        ".bj double / .21点 翻倍：加同额下注，补一张后停牌",
+        ".bj split / .21点 分牌：前两张点数相同可拆成两手",
+        ".bj insurance / .21点 保险：庄家明牌 A 时买保险",
+        ".bj surrender / .21点 投降：前两张牌时退回半注",
+        ".bj status / .21点 状态：查看自己的局",
+        ".bj end / .21点 结束：放弃当前局，按投降结算",
         `默认下注：${defaultBet}${currency}`,
         `下注范围：${minBet}-${maxBet}${currency}`,
-        "胜者获得本局奖池。所有人爆牌时，奖池归庄家。",
     ].join("\n");
 }
 
 function parseBlackjackAction(cmdArgs) {
     const text = parseInputText(cmdArgs).trim();
-    if (!text || isHelpText(text)) return { action: "help", rest: "" };
+    if (isHelpText(text)) return { action: "help", rest: "" };
+    if (!text) return { action: "start", rest: "" };
 
     const parts = text.split(/\s+/);
     const first = parts[0];
@@ -1128,20 +1210,10 @@ function parseBlackjackAction(cmdArgs) {
     const exact = {
         start: "start",
         "开始": "start",
-        "创建": "start",
-        "开桌": "start",
         "开局": "start",
-        join: "join",
-        "加入": "join",
-        "进桌": "join",
-        bet: "bet",
-        "下注": "bet",
-        "押注": "bet",
-        open: "open",
-        "发牌": "open",
-        "开牌": "open",
-        "开本局": "open",
-        "开始本局": "open",
+        bet: "start",
+        "下注": "start",
+        "押注": "start",
         hit: "hit",
         "要牌": "hit",
         "摸牌": "hit",
@@ -1149,18 +1221,32 @@ function parseBlackjackAction(cmdArgs) {
         "停牌": "stand",
         "不要": "stand",
         "过": "stand",
+        double: "double",
+        doubledown: "double",
+        "翻倍": "double",
+        "加倍": "double",
+        split: "split",
+        "分牌": "split",
+        insurance: "insurance",
+        "保险": "insurance",
+        pass: "pass",
+        skip: "pass",
+        "跳过": "pass",
+        "不买": "pass",
+        surrender: "surrender",
+        "投降": "surrender",
         status: "status",
         "状态": "status",
         chips: "chips",
         "筹码": "chips",
         "余额": "chips",
-        exit: "exit",
-        "退出": "exit",
-        "离开": "exit",
         end: "end",
+        exit: "end",
         "结束": "end",
-        "解散": "end",
+        "退出": "end",
+        "放弃": "end",
     };
+    if (/^\d+$/.test(first)) return { action: "start", rest: text };
     if (exact[firstLower]) return { action: exact[firstLower], rest };
     if (exact[first]) return { action: exact[first], rest };
 
@@ -1169,7 +1255,7 @@ function parseBlackjackAction(cmdArgs) {
         if (firstLower.startsWith(prefix) || first.startsWith(prefix)) {
             const amount = first.slice(prefix.length).trim();
             const suffix = [amount, rest].filter(Boolean).join(" ").trim();
-            return { action: "bet", rest: suffix };
+            return { action: "start", rest: suffix };
         }
     }
     return { action: "unknown", rest: text };
@@ -1180,181 +1266,300 @@ function replyBlackjackUseBlocked(ctx, msg, userId, actionText) {
     return replyDebtBlocked(ctx, msg, userId, actionText);
 }
 
-function sendBlackjackPrivate(ctx, msg, userId, text) {
-    try {
-        if (typeof seal.createTempCtx === "function") {
-            const privateCtx = seal.createTempCtx(ctx, userId);
-            if (privateCtx) {
-                seal.replyToSender(privateCtx, { rawId: userId, sender: { userId } }, text);
-                return true;
-            }
-        }
-    } catch (e) {}
-
-    try {
-        if (typeof seal.replyPerson === "function" && getUserId(ctx, msg) === userId) {
-            seal.replyPerson(ctx, msg, text);
-            return true;
-        }
-    } catch (e) {}
-    return false;
+function getBlackjackCurrentHand(round) {
+    if (!round || !Array.isArray(round.hands)) return null;
+    return round.hands[round.currentHandIndex] || null;
 }
 
-async function blackjackWait() {
-    const seconds = getBlackjackWaitSeconds();
-    if (seconds > 0) await sleep(seconds * 1000);
+function formatBlackjackDealerHand(round, reveal) {
+    const dealerHand = Array.isArray(round.dealerHand) ? round.dealerHand : [];
+    if (reveal || round.dealerHoleRevealed) return formatBlackjackHand(dealerHand);
+    if (dealerHand.length <= 0) return "无牌";
+    return `${formatBlackjackCard(dealerHand[0])} [暗牌]`;
 }
 
-function promptBlackjackPlayer(ctx, msg, round) {
-    const player = round.players[round.currentPlayerIndex];
-    if (!player) return;
-    seal.replyToSender(ctx, msg, [
-        `轮到 ${player.name} 操作。`,
-        "请选择：.bj hit 要牌 / .bj stand 停牌",
-    ].join("\n"));
+function formatBlackjackHandSummary(hand, index, isCurrent) {
+    const info = getBlackjackHandInfo(hand);
+    const tags = [];
+    if (isCurrent) tags.push("当前");
+    if (isNaturalBlackjack(hand)) tags.push("Blackjack");
+    if (hand.doubled) tags.push("翻倍");
+    if (hand.splitAces) tags.push("分A");
+    if (hand.busted) tags.push("爆牌");
+    if (hand.surrendered) tags.push("投降");
+    if (hand.stood) tags.push("停牌");
+    const suffix = tags.length > 0 ? ` [${tags.join("，")}]` : "";
+    return `手牌${index + 1}：${formatBlackjackHand(hand)} = ${info.value}点，下注 ${hand.bet}${suffix}`;
 }
 
-function prepareBlackjackNextRound(round) {
-    for (const player of round.players) {
-        player.hand = [];
-        player.bet = 0;
-        player.busted = false;
-        player.stood = false;
+function getBlackjackActionPrompt(round) {
+    const hand = getBlackjackCurrentHand(round);
+    if (!hand) return "";
+    const options = [".bj hit 要牌", ".bj stand 停牌"];
+    if (hand.cards.length === 2 && !hand.doubled) {
+        options.push(".bj double 翻倍", ".bj surrender 投降");
+        if (getBlackjackCardPoint(hand.cards[0]) === getBlackjackCardPoint(hand.cards[1])) options.push(".bj split 分牌");
     }
-    round.phase = "betting";
-    round.joinLocked = false;
-    round.currentPlayerIndex = -1;
-    round.pot = 0;
-    resetBlackjackDeck(round);
-}
-
-function settleBlackjackRound(ctx, msg, groupId, round) {
-    const currency = getStringConfig("货币名", "金币");
-    const pot = getBlackjackPot(round);
-    const validPlayers = round.players.filter(player => !player.busted);
-    let winner = null;
-    let winnerValue = -1;
-    let allBusted = false;
-
-    if (validPlayers.length <= 0) {
-        winner = getBlackjackDealer(round);
-        allBusted = true;
-    } else {
-        for (const player of validPlayers) {
-            const value = getBlackjackHandValue(player.hand);
-            if (value > winnerValue) {
-                winnerValue = value;
-                winner = player;
-            }
-        }
-    }
-
-    if (winner && pot > 0) {
-        applyIncome(winner.userId, pot);
-    }
-
-    const details = round.players.map((player, index) => {
-        const value = getBlackjackHandValue(player.hand);
-        const marks = [];
-        if (player.busted) marks.push("爆牌");
-        if (player.stood) marks.push("停牌");
-        const suffix = marks.length > 0 ? ` [${marks.join("，")}]` : "";
-        return `[${index + 1}] ${player.name}${player.isDealer ? "(庄)" : ""}：${formatBlackjackHand(player.hand)} = ${value}点${suffix}`;
-    });
-
-    const lines = [
-        "🃏 【21点结算】",
-        `奖池：${pot}${currency}`,
-        ...details,
-    ];
-    if (allBusted) {
-        lines.push(`所有人爆牌，奖池归庄家 ${winner ? winner.name : "庄家"}。`);
-    } else {
-        lines.push(`胜者：${winner ? winner.name : "无"}，获得 ${pot}${currency}。`);
-    }
-    lines.push("净变化：");
-    for (const player of round.players) {
-        const net = winner && winner.userId === player.userId ? pot - player.bet : -player.bet;
-        const prefix = net >= 0 ? "+" : "";
-        lines.push(`${player.name}${player.isDealer ? "(庄)" : ""}：${prefix}${net}${currency}，余额 ${getWallet(player.userId)}${currency}`);
-    }
-
-    prepareBlackjackNextRound(round);
-    setBlackjackRound(groupId, round);
-    lines.push("本桌保留。从庄家重新下注开始，新玩家仍可加入。");
-    seal.replyToSender(ctx, msg, lines.join("\n"));
-}
-
-async function openBlackjackRound(ctx, msg, groupId, round) {
-    const currency = getStringConfig("货币名", "金币");
-    round.joinLocked = true;
-    round.phase = "dealing";
-    round.currentPlayerIndex = -1;
-    round.pot = getBlackjackPot(round);
-    resetBlackjackDeck(round);
-    for (const player of round.players) {
-        player.hand = [];
-        player.busted = false;
-        player.stood = false;
-        dealBlackjackCard(round, player);
-        dealBlackjackCard(round, player);
-    }
-    setBlackjackRound(groupId, round);
-
-    const order = round.players.map((player, index) => `${index + 1}.${player.name}${player.isDealer ? "(庄)" : ""}`).join(" > ");
-    seal.replyToSender(ctx, msg, [
-        "🃏 【21点开牌】",
-        `奖池：${round.pot}${currency}`,
-        `操作顺序：${order}`,
-    ].join("\n"));
-
-    for (const player of round.players) {
-        const value = getBlackjackHandValue(player.hand);
-        const privateText = [
-            "【21点手牌】",
-            `你的手牌：${formatBlackjackHand(player.hand)}`,
-            `当前点数：${value}`,
-        ].join("\n");
-        const sent = sendBlackjackPrivate(ctx, msg, player.userId, privateText);
-        if (sent) {
-            seal.replyToSender(ctx, msg, `${player.name} 已收到手牌。`);
-        } else {
-            seal.replyToSender(ctx, msg, `${player.name} 私聊发送失败，手牌改在群内发送：${formatBlackjackHand(player.hand)}（${value}点）`);
-        }
-        await blackjackWait();
-    }
-
-    round.phase = "playing";
-    round.currentPlayerIndex = 0;
-    setBlackjackRound(groupId, round);
-    promptBlackjackPlayer(ctx, msg, round);
+    return [
+        `轮到手牌${round.currentHandIndex + 1}。`,
+        `可选：${options.join(" / ")}`,
+    ].join("\n");
 }
 
 function getBlackjackStatusText(round) {
     const currency = getStringConfig("货币名", "金币");
     const phaseName = {
-        waiting: "等待加入",
-        betting: "下注中",
-        dealing: "发牌中",
-        playing: "操作中",
-    }[round.phase] || round.phase || "未知";
+        insurance: "保险选择",
+        playing: "玩家操作",
+    }[round.phase] || "结算中";
+    const dealerInfo = getBlackjackHandInfo(round.dealerHand);
     const lines = [
-        "21点牌桌状态",
-        `庄家：${round.dealerName || round.dealerId}`,
+        "21点个人局状态",
+        `玩家：${round.playerName || round.userId}`,
         `阶段：${phaseName}`,
-        `奖池：${getBlackjackPot(round)}${currency}`,
+        `庄家：${formatBlackjackDealerHand(round, false)}${round.dealerHoleRevealed ? ` = ${dealerInfo.value}点` : ""}`,
+        `总下注：${getBlackjackTotalBet(round)}${currency}`,
     ];
-    round.players.forEach((player, index) => {
-        const tags = [];
-        if (player.isDealer) tags.push("庄");
-        if (round.phase === "playing" && round.currentPlayerIndex === index) tags.push("当前");
-        if (player.busted) tags.push("爆牌");
-        if (player.stood) tags.push("停牌");
-        const tagText = tags.length > 0 ? ` (${tags.join("，")})` : "";
-        const handText = round.phase === "playing" ? `${player.hand.length}张牌` : "未发牌";
-        lines.push(`${index + 1}. ${player.name}${tagText}：下注 ${player.bet}${currency}，${handText}`);
+    if (round.insuranceBet > 0) lines.push(`保险：${round.insuranceBet}${currency}`);
+    round.hands.forEach((hand, index) => {
+        lines.push(formatBlackjackHandSummary(hand, index, round.phase === "playing" && index === round.currentHandIndex));
     });
-    return lines.join("\n");
+    if (round.phase === "insurance") lines.push("庄家明牌为 A，可用 .bj insurance 买保险，或 .bj pass 跳过。");
+    if (round.phase === "playing") lines.push(getBlackjackActionPrompt(round));
+    return lines.filter(Boolean).join("\n");
+}
+
+function advanceBlackjackHand(round) {
+    while (round.currentHandIndex < round.hands.length) {
+        const hand = round.hands[round.currentHandIndex];
+        if (!hand || hand.finished || hand.busted || hand.surrendered || hand.stood) {
+            round.currentHandIndex += 1;
+            continue;
+        }
+        break;
+    }
+}
+
+function hasBlackjackHandForDealer(round) {
+    return round.hands.some(hand => !hand.busted && !hand.surrendered);
+}
+
+function getBlackjackHandSettlement(hand, round, dealerInfo, dealerBlackjack, currency) {
+    const bet = Math.max(0, Math.floor(Number(hand.bet) || 0));
+    if (hand.surrendered) {
+        const returned = Math.floor(bet / 2);
+        return { returned, label: `退回 ${returned}${currency}` };
+    }
+    if (hand.busted) return { returned: 0, label: "爆牌，输掉下注" };
+    if (dealerBlackjack) {
+        if (isNaturalBlackjack(hand)) return { returned: bet, label: `庄家 Blackjack，平局退回 ${bet}${currency}` };
+        return { returned: 0, label: "庄家 Blackjack，输掉下注" };
+    }
+    if (isNaturalBlackjack(hand)) {
+        const profit = Math.floor(bet * 3 / 2);
+        return { returned: bet + profit, label: `Blackjack，赔付 ${profit}${currency}` };
+    }
+    if (dealerInfo.value > 21) return { returned: bet * 2, label: `庄家爆牌，赢得 ${bet}${currency}` };
+
+    const playerValue = getBlackjackHandValue(hand);
+    if (playerValue > dealerInfo.value) return { returned: bet * 2, label: `玩家 ${playerValue} 点大于庄家 ${dealerInfo.value} 点，赢得 ${bet}${currency}` };
+    if (playerValue < dealerInfo.value) return { returned: 0, label: `玩家 ${playerValue} 点小于庄家 ${dealerInfo.value} 点，输掉下注` };
+    return { returned: bet, label: `同为 ${playerValue} 点，平局退回 ${bet}${currency}` };
+}
+
+function settleBlackjackRound(ctx, msg, groupId, userId, round, introLines, options) {
+    const currency = getStringConfig("货币名", "金币");
+    const forceSurrender = Boolean(options && options.forceSurrender);
+    const skipDealerDraw = Boolean(options && options.skipDealerDraw);
+
+    if (forceSurrender) {
+        for (const hand of round.hands) {
+            if (!hand.busted && !hand.surrendered) {
+                hand.surrendered = true;
+                hand.finished = true;
+            }
+        }
+    } else if (!skipDealerDraw && hasBlackjackHandForDealer(round) && !isDealerBlackjack(round)) {
+        playBlackjackDealer(round);
+    } else {
+        round.dealerHoleRevealed = true;
+    }
+
+    const dealerInfo = getBlackjackHandInfo(round.dealerHand);
+    const dealerBlackjack = isDealerBlackjack(round);
+    const lines = Array.isArray(introLines) ? introLines.slice() : [];
+    lines.push(
+        "🃏 【21点结算】",
+        `庄家手牌：${formatBlackjackHand(round.dealerHand)} = ${dealerInfo.value}点`,
+    );
+
+    let totalReturned = 0;
+    let totalMainBet = 0;
+    round.hands.forEach((hand, index) => {
+        totalMainBet += hand.bet;
+        const result = getBlackjackHandSettlement(hand, round, dealerInfo, dealerBlackjack, currency);
+        totalReturned += result.returned;
+        const returnedText = result.returned > 0 ? `，合计返还 ${result.returned}${currency}` : "";
+        lines.push(`${formatBlackjackHandSummary(hand, index, false)}：${result.label}${returnedText}`);
+    });
+
+    if (round.insuranceBet > 0) {
+        if (dealerBlackjack) {
+            const insuranceReturned = round.insuranceBet * 3;
+            totalReturned += insuranceReturned;
+            lines.push(`保险命中，返还 ${insuranceReturned}${currency}。`);
+        } else {
+            lines.push(`保险未中，扣除 ${round.insuranceBet}${currency}。`);
+        }
+    }
+
+    if (totalReturned > 0) {
+        setWallet(userId, getWallet(userId) + totalReturned);
+    }
+    clearBlackjackRound(groupId, userId);
+
+    const net = totalReturned - totalMainBet - round.insuranceBet;
+    const prefix = net >= 0 ? "+" : "";
+    lines.push(`本局净变化：${prefix}${net}${currency}`);
+    lines.push(`当前余额：${getWallet(userId)}${currency}`);
+    seal.replyToSender(ctx, msg, lines.join("\n"));
+}
+
+function continueBlackjackAfterAction(ctx, msg, groupId, userId, round, lines) {
+    advanceBlackjackHand(round);
+    if (round.currentHandIndex >= round.hands.length) {
+        settleBlackjackRound(ctx, msg, groupId, userId, round, lines);
+        return;
+    }
+    setBlackjackRound(groupId, userId, round);
+    lines.push(getBlackjackActionPrompt(round));
+    seal.replyToSender(ctx, msg, lines.filter(Boolean).join("\n"));
+}
+
+function startBlackjackPlayingOrSettle(ctx, msg, groupId, userId, round, introLines) {
+    if (isDealerBlackjack(round) || isNaturalBlackjack(round.hands[0])) {
+        settleBlackjackRound(ctx, msg, groupId, userId, round, introLines, { skipDealerDraw: true });
+        return;
+    }
+    round.phase = "playing";
+    round.currentHandIndex = 0;
+    setBlackjackRound(groupId, userId, round);
+    introLines.push(getBlackjackActionPrompt(round));
+    seal.replyToSender(ctx, msg, introLines.filter(Boolean).join("\n"));
+}
+
+function startBlackjackRound(ctx, msg, groupId, userId, playerName, amountText) {
+    const currency = getStringConfig("货币名", "金币");
+    if (replyBlackjackUseBlocked(ctx, msg, userId, "下注21点")) return;
+
+    const bet = parseBlackjackBetAmount(amountText);
+    if (!bet.ok) {
+        seal.replyToSender(ctx, msg, bet.reason);
+        return;
+    }
+
+    const balance = getWallet(userId);
+    if (balance < bet.amount) {
+        seal.replyToSender(ctx, msg, [
+            `余额不足，当前余额：${balance}${currency}`,
+            `本次下注需要：${bet.amount}${currency}`,
+            "可以使用 .低保 领取每日低保。",
+        ].join("\n"));
+        return;
+    }
+
+    setWallet(userId, balance - bet.amount);
+    const round = {
+        rulesVersion: 2,
+        groupId,
+        userId,
+        playerName,
+        phase: "playing",
+        currentHandIndex: 0,
+        deck: createBlackjackDeck(),
+        dealerHand: [],
+        dealerHoleRevealed: false,
+        insuranceBet: 0,
+        hands: [{
+            cards: [],
+            bet: bet.amount,
+            originalBet: bet.amount,
+            fromSplit: false,
+            splitAces: false,
+            doubled: false,
+            stood: false,
+            busted: false,
+            surrendered: false,
+            finished: false,
+        }],
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+    };
+
+    const hand = round.hands[0];
+    dealBlackjackCardToHand(round, hand.cards);
+    dealBlackjackCardToHand(round, round.dealerHand);
+    dealBlackjackCardToHand(round, hand.cards);
+    dealBlackjackCardToHand(round, round.dealerHand);
+
+    const handInfo = getBlackjackHandInfo(hand);
+    const lines = [
+        "🃏 【21点开局】",
+        `${playerName} 下注 ${bet.amount}${currency}。`,
+        `你的手牌：${formatBlackjackHand(hand)} = ${handInfo.value}点`,
+        `庄家手牌：${formatBlackjackDealerHand(round, false)}`,
+    ];
+
+    if (round.dealerHand[0] && round.dealerHand[0].rank === "A") {
+        round.phase = "insurance";
+        setBlackjackRound(groupId, userId, round);
+        lines.push("庄家明牌为 A，可用 .bj insurance 买保险，或 .bj pass 跳过。");
+        seal.replyToSender(ctx, msg, lines.join("\n"));
+        return;
+    }
+
+    startBlackjackPlayingOrSettle(ctx, msg, groupId, userId, round, lines);
+}
+
+function resolveBlackjackInsurance(ctx, msg, groupId, userId, round, buyInsurance) {
+    const currency = getStringConfig("货币名", "金币");
+    const lines = [];
+    if (round.phase !== "insurance") {
+        seal.replyToSender(ctx, msg, "当前不能购买保险。");
+        return;
+    }
+    if (buyInsurance) {
+        if (round.insuranceBet > 0) {
+            seal.replyToSender(ctx, msg, "你已经买过保险。");
+            return;
+        }
+        const amount = Math.ceil(round.hands[0].originalBet / 2);
+        const balance = getWallet(userId);
+        if (balance < amount) {
+            seal.replyToSender(ctx, msg, [
+                `余额不足，当前余额：${balance}${currency}`,
+                `保险需要：${amount}${currency}`,
+            ].join("\n"));
+            return;
+        }
+        setWallet(userId, balance - amount);
+        round.insuranceBet = amount;
+        lines.push(`买入保险 ${amount}${currency}。`);
+    } else {
+        lines.push("跳过保险。");
+    }
+
+    if (isDealerBlackjack(round) || isNaturalBlackjack(round.hands[0])) {
+        settleBlackjackRound(ctx, msg, groupId, userId, round, lines, { skipDealerDraw: true });
+        return;
+    }
+
+    round.phase = "playing";
+    round.currentHandIndex = 0;
+    setBlackjackRound(groupId, userId, round);
+    lines.push("庄家没有 Blackjack，继续操作。");
+    lines.push(getBlackjackActionPrompt(round));
+    seal.replyToSender(ctx, msg, lines.filter(Boolean).join("\n"));
 }
 
 function scheduleBigSmallSettlement(ctx, msg, groupId, endAt) {
@@ -2763,288 +2968,215 @@ function solveBlackjack(ctx, msg, cmdArgs) {
 
     const currency = getStringConfig("货币名", "金币");
     const playerName = getDisplayName(ctx, msg, userId);
-    let round = getBlackjackRound(groupId);
+    cleanupLegacyBlackjackRound(ctx, msg, groupId);
+    let round = getBlackjackRound(groupId, userId);
 
     if (action === "start") {
         if (round) {
-            seal.replyToSender(ctx, msg, "本群已有一桌21点。\n使用 .bj status 查看状态。");
+            seal.replyToSender(ctx, msg, [
+                "你当前已有一局21点。",
+                "使用 .bj status 查看状态。",
+                "使用 .bj end 放弃当前局。",
+            ].join("\n"));
             return seal.ext.newCmdExecuteResult(true);
         }
-        if (replyBlackjackUseBlocked(ctx, msg, userId, "开21点")) {
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        round = {
-            groupId,
-            dealerId: userId,
-            dealerName: playerName,
-            phase: "waiting",
-            joinLocked: false,
-            currentPlayerIndex: -1,
-            pot: 0,
-            deck: createBlackjackDeck(),
-            players: [{
-                userId,
-                name: playerName,
-                isDealer: true,
-                hand: [],
-                bet: 0,
-                busted: false,
-                stood: false,
-            }],
-            startedAt: Date.now(),
-            updatedAt: Date.now(),
-        };
-        setBlackjackRound(groupId, round);
-        seal.replyToSender(ctx, msg, [
-            `${playerName} 开启了21点牌桌。`,
-            "输入 .bj join 加入牌桌。",
-            "庄家先用 .bj bet 50 下注。",
-        ].join("\n"));
+        startBlackjackRound(ctx, msg, groupId, userId, playerName, parsedAction.rest);
         return seal.ext.newCmdExecuteResult(true);
     }
 
     if (!round) {
-        seal.replyToSender(ctx, msg, "当前没有进行中的21点。\n使用 .bj start 开一桌。");
-        return seal.ext.newCmdExecuteResult(true);
-    }
-
-    if (action === "join") {
-        if (round.joinLocked || (round.phase !== "waiting" && round.phase !== "betting")) {
-            seal.replyToSender(ctx, msg, "本局已经发牌，暂时不能加入。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (findBlackjackPlayer(round, userId)) {
-            seal.replyToSender(ctx, msg, "你已经在这桌21点里了。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (replyBlackjackUseBlocked(ctx, msg, userId, "加入21点")) {
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        round.players.push({
-            userId,
-            name: playerName,
-            isDealer: false,
-            hand: [],
-            bet: 0,
-            busted: false,
-            stood: false,
-        });
-        setBlackjackRound(groupId, round);
-        seal.replyToSender(ctx, msg, [
-            `${playerName} 加入了21点牌桌。`,
-            `当前人数：${getBlackjackIdlePlayers(round).length}名闲家 + 庄家 ${round.dealerName}`,
-        ].join("\n"));
-        return seal.ext.newCmdExecuteResult(true);
-    }
-
-    if (action === "exit") {
-        const player = findBlackjackPlayer(round, userId);
-        if (!player) {
-            seal.replyToSender(ctx, msg, "你当前没有加入这桌21点。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (player.isDealer) {
-            seal.replyToSender(ctx, msg, "庄家不能退出牌桌。\n使用 .bj end 结束未发牌的牌桌。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (round.phase !== "waiting" && round.phase !== "betting") {
-            seal.replyToSender(ctx, msg, "本局已经发牌，暂时不能退出。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        if (player.bet > 0) setWallet(userId, getWallet(userId) + player.bet);
-        round.players = round.players.filter(item => item.userId !== userId);
-        setBlackjackRound(groupId, round);
-        seal.replyToSender(ctx, msg, `${playerName} 退出了21点牌桌。`);
-        return seal.ext.newCmdExecuteResult(true);
-    }
-
-    if (action === "bet") {
-        const player = findBlackjackPlayer(round, userId);
-        if (!player) {
-            seal.replyToSender(ctx, msg, "你还没有加入这桌21点。\n使用 .bj join 加入。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (round.phase !== "waiting" && round.phase !== "betting") {
-            seal.replyToSender(ctx, msg, "当前不在下注阶段。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (player.bet > 0) {
-            seal.replyToSender(ctx, msg, "你本局已经下注了。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (replyBlackjackUseBlocked(ctx, msg, userId, "下注21点")) {
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        const bet = parseBlackjackBetAmount(parsedAction.rest);
-        if (!bet.ok) {
-            seal.replyToSender(ctx, msg, bet.reason);
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        const dealer = getBlackjackDealer(round);
-        if (!player.isDealer) {
-            if (!dealer || dealer.bet <= 0) {
-                seal.replyToSender(ctx, msg, "请等庄家先下注。");
-                return seal.ext.newCmdExecuteResult(true);
-            }
-            if (bet.amount < dealer.bet) {
-                seal.replyToSender(ctx, msg, `闲家下注不能低于庄家下注 ${dealer.bet}${currency}。`);
-                return seal.ext.newCmdExecuteResult(true);
-            }
-        }
-
-        const balance = getWallet(userId);
-        if (balance < bet.amount) {
-            seal.replyToSender(ctx, msg, [
-                `余额不足，当前余额：${balance}${currency}`,
-                `本次下注需要：${bet.amount}${currency}`,
-                "可以使用 .低保 领取每日低保。",
-            ].join("\n"));
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        setWallet(userId, balance - bet.amount);
-        player.bet = bet.amount;
-        round.phase = "betting";
-        setBlackjackRound(groupId, round);
-
-        const idlePlayers = getBlackjackIdlePlayers(round);
-        const waitingPlayers = idlePlayers.filter(item => item.bet <= 0).map(item => item.name);
-        const lines = [
-            `${player.name}${player.isDealer ? "(庄)" : ""} 下注 ${bet.amount}${currency}。`,
-            `当前奖池：${getBlackjackPot(round)}${currency}`,
-            `当前余额：${getWallet(userId)}${currency}`,
-        ];
-        if (dealer && dealer.bet > 0 && idlePlayers.length > 0 && waitingPlayers.length <= 0) {
-            lines.push("所有闲家已下注，庄家可以使用 .bj open 发牌。");
-        } else if (waitingPlayers.length > 0) {
-            lines.push(`等待下注：${waitingPlayers.join("，")}`);
+        if (action === "status") {
+            seal.replyToSender(ctx, msg, "你当前没有进行中的21点。\n使用 .21点 50 开一局。");
         } else {
-            lines.push("等待闲家加入或下注。");
+            seal.replyToSender(ctx, msg, "你当前没有进行中的21点。\n使用 .21点 50 下注开局。");
         }
-        seal.replyToSender(ctx, msg, lines.join("\n"));
-        return seal.ext.newCmdExecuteResult(true);
-    }
-
-    if (action === "open") {
-        const dealer = getBlackjackDealer(round);
-        if (!dealer || dealer.userId !== userId) {
-            seal.replyToSender(ctx, msg, "只有庄家可以发牌。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (replyBlackjackUseBlocked(ctx, msg, userId, "发牌21点")) {
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (round.phase !== "betting") {
-            seal.replyToSender(ctx, msg, "当前还不能发牌。\n庄家和闲家都下注后才能发牌。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        const idlePlayers = getBlackjackIdlePlayers(round);
-        if (idlePlayers.length <= 0) {
-            seal.replyToSender(ctx, msg, "至少需要 1 名闲家才能开始。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (dealer.bet <= 0) {
-            seal.replyToSender(ctx, msg, "庄家需要先下注。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        const unbettors = idlePlayers.filter(player => player.bet <= 0).map(player => player.name);
-        if (unbettors.length > 0) {
-            seal.replyToSender(ctx, msg, `还有闲家未下注：${unbettors.join("，")}`);
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        openBlackjackRound(ctx, msg, groupId, round).catch(() => {
-            seal.replyToSender(ctx, msg, "21点发牌流程出错，本局状态已保留。");
-        });
         return seal.ext.newCmdExecuteResult(true);
     }
 
     if (action === "hit") {
         if (round.phase !== "playing") {
-            seal.replyToSender(ctx, msg, "当前没有正在操作的21点本局。");
+            seal.replyToSender(ctx, msg, "当前需要先处理保险选择。");
             return seal.ext.newCmdExecuteResult(true);
         }
-        const player = findBlackjackPlayer(round, userId);
-        const current = round.players[round.currentPlayerIndex];
-        if (!player) {
-            seal.replyToSender(ctx, msg, "你当前没有加入这桌21点。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (!current || current.userId !== userId) {
-            seal.replyToSender(ctx, msg, "还没轮到你操作。");
+        const hand = getBlackjackCurrentHand(round);
+        if (!hand) {
+            settleBlackjackRound(ctx, msg, groupId, userId, round, []);
             return seal.ext.newCmdExecuteResult(true);
         }
 
-        const card = dealBlackjackCard(round, player);
-        const value = getBlackjackHandValue(player.hand);
-        player.busted = value > 21;
-        const privateText = [
-            "【21点要牌】",
-            `得到：${formatBlackjackCard(card)}`,
-            `当前手牌：${formatBlackjackHand(player.hand)}`,
-            `当前点数：${value}`,
-        ].join("\n");
-        const sent = sendBlackjackPrivate(ctx, msg, userId, privateText);
-        const lines = [];
-        if (sent) {
-            lines.push(`${player.name} 已要牌。`);
+        const card = dealBlackjackCardToHand(round, hand.cards);
+        const value = getBlackjackHandValue(hand);
+        const lines = [
+            `手牌${round.currentHandIndex + 1} 要牌：${formatBlackjackCard(card)}`,
+            `当前手牌：${formatBlackjackHand(hand)} = ${value}点`,
+        ];
+        if (value > 21) {
+            hand.busted = true;
+            hand.finished = true;
+            lines.push("这手爆牌。");
+        } else if (value === 21) {
+            hand.stood = true;
+            hand.finished = true;
+            lines.push("这手达到 21 点，自动停牌。");
         } else {
-            lines.push(`${player.name} 已要牌：${formatBlackjackCard(card)}，当前 ${value}点。`);
-        }
-
-        if (player.busted) {
-            lines.push(`${player.name} 爆牌，操作结束。`);
-            round.currentPlayerIndex += 1;
-        } else {
-            lines.push("请选择：.bj hit 要牌 / .bj stand 停牌");
-        }
-
-        if (round.currentPlayerIndex >= round.players.length) {
-            setBlackjackRound(groupId, round);
+            setBlackjackRound(groupId, userId, round);
+            lines.push(getBlackjackActionPrompt(round));
             seal.replyToSender(ctx, msg, lines.join("\n"));
-            settleBlackjackRound(ctx, msg, groupId, round);
             return seal.ext.newCmdExecuteResult(true);
         }
 
-        setBlackjackRound(groupId, round);
-        seal.replyToSender(ctx, msg, lines.join("\n"));
-        if (player.busted) promptBlackjackPlayer(ctx, msg, round);
+        continueBlackjackAfterAction(ctx, msg, groupId, userId, round, lines);
         return seal.ext.newCmdExecuteResult(true);
     }
 
     if (action === "stand") {
         if (round.phase !== "playing") {
-            seal.replyToSender(ctx, msg, "当前没有正在操作的21点本局。");
+            seal.replyToSender(ctx, msg, "当前需要先处理保险选择。");
             return seal.ext.newCmdExecuteResult(true);
         }
-        const player = findBlackjackPlayer(round, userId);
-        const current = round.players[round.currentPlayerIndex];
-        if (!player) {
-            seal.replyToSender(ctx, msg, "你当前没有加入这桌21点。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (!current || current.userId !== userId) {
-            seal.replyToSender(ctx, msg, "还没轮到你操作。");
+        const hand = getBlackjackCurrentHand(round);
+        if (!hand) {
+            settleBlackjackRound(ctx, msg, groupId, userId, round, []);
             return seal.ext.newCmdExecuteResult(true);
         }
 
-        player.stood = true;
-        round.currentPlayerIndex += 1;
-        if (round.currentPlayerIndex >= round.players.length) {
-            setBlackjackRound(groupId, round);
-            seal.replyToSender(ctx, msg, `${player.name} 停牌。`);
-            settleBlackjackRound(ctx, msg, groupId, round);
+        hand.stood = true;
+        hand.finished = true;
+        continueBlackjackAfterAction(ctx, msg, groupId, userId, round, [`手牌${round.currentHandIndex + 1} 停牌。`]);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "double") {
+        if (round.phase !== "playing") {
+            seal.replyToSender(ctx, msg, "当前不能翻倍。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        const hand = getBlackjackCurrentHand(round);
+        if (!hand || hand.cards.length !== 2 || hand.doubled) {
+            seal.replyToSender(ctx, msg, "只有当前手牌前两张时可以翻倍。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        if (replyBlackjackUseBlocked(ctx, msg, userId, "翻倍21点")) {
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        const balance = getWallet(userId);
+        if (balance < hand.bet) {
+            seal.replyToSender(ctx, msg, [
+                `余额不足，当前余额：${balance}${currency}`,
+                `翻倍需要追加：${hand.bet}${currency}`,
+            ].join("\n"));
             return seal.ext.newCmdExecuteResult(true);
         }
 
-        setBlackjackRound(groupId, round);
-        seal.replyToSender(ctx, msg, `${player.name} 停牌。`);
-        promptBlackjackPlayer(ctx, msg, round);
+        setWallet(userId, balance - hand.bet);
+        const addedBet = hand.bet;
+        hand.bet += addedBet;
+        hand.doubled = true;
+        const card = dealBlackjackCardToHand(round, hand.cards);
+        const value = getBlackjackHandValue(hand);
+        hand.busted = value > 21;
+        hand.stood = true;
+        hand.finished = true;
+        const lines = [
+            `手牌${round.currentHandIndex + 1} 翻倍，追加 ${addedBet}${currency}。`,
+            `补牌：${formatBlackjackCard(card)}`,
+            `当前手牌：${formatBlackjackHand(hand)} = ${value}点`,
+        ];
+        if (hand.busted) lines.push("这手爆牌。");
+        continueBlackjackAfterAction(ctx, msg, groupId, userId, round, lines);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "split") {
+        if (round.phase !== "playing") {
+            seal.replyToSender(ctx, msg, "当前不能分牌。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        const hand = getBlackjackCurrentHand(round);
+        if (!hand || hand.cards.length !== 2) {
+            seal.replyToSender(ctx, msg, "只有当前手牌前两张时可以分牌。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        if (round.hands.length >= 4) {
+            seal.replyToSender(ctx, msg, "本局最多分到 4 手牌。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        if (getBlackjackCardPoint(hand.cards[0]) !== getBlackjackCardPoint(hand.cards[1])) {
+            seal.replyToSender(ctx, msg, "前两张点数相同才能分牌。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        if (replyBlackjackUseBlocked(ctx, msg, userId, "分牌21点")) {
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        const balance = getWallet(userId);
+        if (balance < hand.bet) {
+            seal.replyToSender(ctx, msg, [
+                `余额不足，当前余额：${balance}${currency}`,
+                `分牌需要追加：${hand.bet}${currency}`,
+            ].join("\n"));
+            return seal.ext.newCmdExecuteResult(true);
+        }
+
+        setWallet(userId, balance - hand.bet);
+        const firstCard = hand.cards[0];
+        const secondCard = hand.cards[1];
+        const splitAces = firstCard.rank === "A" && secondCard.rank === "A";
+        const handA = normalizeBlackjackHand({
+            cards: [firstCard],
+            bet: hand.bet,
+            originalBet: hand.originalBet,
+            fromSplit: true,
+            splitAces,
+        });
+        const handB = normalizeBlackjackHand({
+            cards: [secondCard],
+            bet: hand.bet,
+            originalBet: hand.originalBet,
+            fromSplit: true,
+            splitAces,
+        });
+        dealBlackjackCardToHand(round, handA.cards);
+        dealBlackjackCardToHand(round, handB.cards);
+        if (splitAces) {
+            handA.stood = true;
+            handA.finished = true;
+            handB.stood = true;
+            handB.finished = true;
+        }
+        round.hands.splice(round.currentHandIndex, 1, handA, handB);
+        const lines = [
+            `手牌${round.currentHandIndex + 1} 分牌，追加 ${hand.bet}${currency}。`,
+            formatBlackjackHandSummary(handA, round.currentHandIndex, !splitAces),
+            formatBlackjackHandSummary(handB, round.currentHandIndex + 1, false),
+        ];
+        if (splitAces) lines.push("分 A 每手补一张后停牌。");
+        continueBlackjackAfterAction(ctx, msg, groupId, userId, round, lines);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "surrender") {
+        if (round.phase !== "playing") {
+            seal.replyToSender(ctx, msg, "当前不能投降。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        const hand = getBlackjackCurrentHand(round);
+        if (!hand || hand.cards.length !== 2 || hand.doubled) {
+            seal.replyToSender(ctx, msg, "只有当前手牌前两张时可以投降。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        hand.surrendered = true;
+        hand.finished = true;
+        continueBlackjackAfterAction(ctx, msg, groupId, userId, round, [`手牌${round.currentHandIndex + 1} 投降。`]);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "insurance") {
+        resolveBlackjackInsurance(ctx, msg, groupId, userId, round, true);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "pass") {
+        resolveBlackjackInsurance(ctx, msg, groupId, userId, round, false);
         return seal.ext.newCmdExecuteResult(true);
     }
 
@@ -3054,28 +3186,7 @@ function solveBlackjack(ctx, msg, cmdArgs) {
     }
 
     if (action === "end") {
-        const dealer = getBlackjackDealer(round);
-        if (!dealer || dealer.userId !== userId) {
-            seal.replyToSender(ctx, msg, "只有庄家可以结束牌桌。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-        if (round.phase === "playing") {
-            seal.replyToSender(ctx, msg, "本局已经发牌，先打完本局。");
-            return seal.ext.newCmdExecuteResult(true);
-        }
-
-        let refundTotal = 0;
-        for (const player of round.players) {
-            if (player.bet > 0) {
-                setWallet(player.userId, getWallet(player.userId) + player.bet);
-                refundTotal += player.bet;
-            }
-        }
-        clearBlackjackRound(groupId);
-        seal.replyToSender(ctx, msg, [
-            `${playerName} 结束了21点牌桌。`,
-            `已退还下注：${refundTotal}${currency}`,
-        ].join("\n"));
+        settleBlackjackRound(ctx, msg, groupId, userId, round, ["放弃当前21点局。"], { forceSurrender: true });
         return seal.ext.newCmdExecuteResult(true);
     }
 
@@ -3112,8 +3223,12 @@ ext.cmdMap["时髦排行榜"] = cmdFashionRank;
 ext.cmdMap["买大小"] = cmdBigSmall;
 ext.cmdMap["买大"] = cmdBuyBig;
 ext.cmdMap["买小"] = cmdBuySmall;
-delete ext.cmdMap["bj"];
-delete ext.cmdMap["21点"];
+const cmdBlackjack = seal.ext.newCmdItemInfo();
+cmdBlackjack.name = "21点";
+cmdBlackjack.help = getBlackjackHelpText();
+cmdBlackjack.solve = solveBlackjack;
+ext.cmdMap["21点"] = cmdBlackjack;
+ext.cmdMap["bj"] = cmdBlackjack;
 
 function rememberMessageSender(ctx, msg) {
     const userId = getUserId(ctx, msg);
