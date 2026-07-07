@@ -1,0 +1,212 @@
+{
+  "character_name": {
+    "box": [
+      690,
+      178,
+      1038,
+      268
+    ],
+    "font": 58,
+    "anchor": "mm"
+  },
+  "player_name": {
+    "box": [
+      820,
+      288,
+      1000,
+      325
+    ],
+    "font": 30,
+    "anchor": "lm"
+  },
+  "profession": {
+    "box": [
+      672,
+      400,
+      932,
+      454
+    ],
+    "font": 42,
+    "anchor": "mm"
+  },
+  "eval_points": {
+    "box": [
+      225,
+      500,
+      390,
+      558
+    ],
+    "font": 48,
+    "anchor": "lm"
+  },
+  "overall_rank": {
+    "box": [
+      418,
+      218,
+      673,
+      322
+    ],
+    "font": 58,
+    "anchor": "mm"
+  },
+  "speed_rank": {
+    "box": [
+      55,
+      690,
+      140,
+      773
+    ],
+    "font": 34,
+    "anchor": "mm"
+  },
+  "speed_value": {
+    "box": [
+      156,
+      699,
+      238,
+      764
+    ],
+    "font": 50,
+    "anchor": "mm"
+  },
+  "stamina_rank": {
+    "box": [
+      280,
+      690,
+      365,
+      773
+    ],
+    "font": 34,
+    "anchor": "mm"
+  },
+  "stamina_value": {
+    "box": [
+      382,
+      699,
+      464,
+      764
+    ],
+    "font": 50,
+    "anchor": "mm"
+  },
+  "power_rank": {
+    "box": [
+      505,
+      690,
+      590,
+      773
+    ],
+    "font": 34,
+    "anchor": "mm"
+  },
+  "power_value": {
+    "box": [
+      607,
+      699,
+      690,
+      764
+    ],
+    "font": 50,
+    "anchor": "mm"
+  },
+  "guts_rank": {
+    "box": [
+      730,
+      690,
+      815,
+      773
+    ],
+    "font": 34,
+    "anchor": "mm"
+  },
+  "guts_value": {
+    "box": [
+      832,
+      699,
+      915,
+      764
+    ],
+    "font": 50,
+    "anchor": "mm"
+  },
+  "wisdom_rank": {
+    "box": [
+      955,
+      690,
+      1040,
+      773
+    ],
+    "font": 34,
+    "anchor": "mm"
+  },
+  "wisdom_value": {
+    "box": [
+      1057,
+      699,
+      1140,
+      764
+    ],
+    "font": 50,
+    "anchor": "mm"
+  },
+  "combat_grade": {
+    "box": [
+      230,
+      842,
+      330,
+      932
+    ],
+    "font": 56,
+    "anchor": "mm"
+  },
+  "combat_text": {
+    "box": [
+      360,
+      846,
+      1116,
+      928
+    ],
+    "font": 34,
+    "anchor": "lm"
+  },
+  "explore_grade": {
+    "box": [
+      230,
+      976,
+      330,
+      1066
+    ],
+    "font": 56,
+    "anchor": "mm"
+  },
+  "explore_text": {
+    "box": [
+      360,
+      980,
+      1116,
+      1062
+    ],
+    "font": 34,
+    "anchor": "lm"
+  },
+  "survive_grade": {
+    "box": [
+      230,
+      1110,
+      330,
+      1200
+    ],
+    "font": 56,
+    "anchor": "mm"
+  },
+  "survive_text": {
+    "box": [
+      360,
+      1114,
+      1116,
+      1196
+    ],
+    "font": 34,
+    "anchor": "lm"
+  }
+}

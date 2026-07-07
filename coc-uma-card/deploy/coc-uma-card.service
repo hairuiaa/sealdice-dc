@@ -1,0 +1,14 @@
+[Unit]
+Description=COC Uma Musume Card Converter
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/coc-uma-card
+ExecStart=/root/coc-uma-card/.venv/bin/python /root/coc-uma-card/uma_musume.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

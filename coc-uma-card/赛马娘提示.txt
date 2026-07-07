@@ -1,0 +1,66 @@
+COC 角色卡转赛马娘育成卡
+
+一、需要安装
+
+Python 依赖：
+
+pip install flask pillow openpyxl requests
+
+可选依赖：
+
+LibreOffice
+
+如果角色卡里有公式，或者文件是 xls，建议安装 LibreOffice。没有 LibreOffice 时，普通 xlsx 仍然可以读取。
+
+二、启动后端
+
+在本目录运行：
+
+python3 uma_musume.py
+
+默认端口：
+
+http://127.0.0.1:21999
+
+健康检查：
+
+http://127.0.0.1:21999/health
+
+三、海豹骰插件
+
+把 `赛马娘角色卡.js` 放到海豹骰扩展目录。
+
+插件配置：
+
+- `OneBot_API_地址`：Bot 客户端的 HTTP 监听地址。当前 Docker 部署走 llbot/Milky，使用 `http://luckylillia:3010/api`
+- `赛马娘转换后端`：本后端地址。当前 Docker 部署使用 `http://coc-uma-card:21999`，后端和海豹骰在同一宿主机非容器环境时可用 `http://127.0.0.1:21999`
+
+群内用法：
+
+1. 先上传 Excel 格式 COC 角色卡。
+2. 输入 `.赛马娘`。
+3. 插件会优先使用刚捕获的表格；如果 llbot 没把上传事件传给海豹骰，会从群文件列表里取最近的 Excel，生成 PNG 并发回群里。
+
+四、本地测试
+
+生成样例 Excel：
+
+python3 tools/create_sample_coc_excel.py
+
+本地直接生成卡图：
+
+python3 - <<'PY'
+from uma_musume import build_card_from_file
+print(build_card_from_file("samples/sample_coc_character.xlsx"))
+PY
+
+输出图片会保存在 `achievements/` 目录。
+
+五、主要文件
+
+- `uma_musume.py`：解析、换算、渲染和 Flask API
+- `赛马娘角色卡.js`：海豹骰指令
+- `assets/uma_final_template_blank.png`：正式空白模板
+- `assets/uma_final_template_map.json`：坐标表
+- `assets/rank_badges/`：总评级徽章
+- `assets/stat_badges/`：五维小徽章
