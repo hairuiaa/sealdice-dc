@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         COC角色卡转赛马娘育成卡
 // @author       Air, Codex
-// @version      1.0.5
+// @version      1.0.6
 // @description  上传 Excel 格式 COC 角色卡后，用 .赛马娘 生成赛马娘风格育成卡
 // @timestamp    1783468800
 // @license      MIT
@@ -9,7 +9,7 @@
 
 let ext = seal.ext.find('coc-uma-card');
 if (!ext) {
-  ext = seal.ext.new('coc-uma-card', 'Air, Codex', '1.0.5');
+  ext = seal.ext.new('coc-uma-card', 'Air, Codex', '1.0.6');
   seal.ext.register(ext);
 }
 
@@ -117,7 +117,22 @@ function collectArgs(cmdArgs, startIndex) {
   return rest;
 }
 
-function extractAtQQ(msg) {
+function normalizeAtUserId(value) {
+  if (value === undefined || value === null) return '';
+  const match = String(value).match(/(?:QQ:)?(\d+)/);
+  return match ? match[1] : '';
+}
+
+function extractAtQQ(msg, cmdArgs) {
+  const atList = cmdArgs && Array.isArray(cmdArgs.at) ? cmdArgs.at : [];
+  for (const item of atList) {
+    const userId = normalizeAtUserId(
+      item && typeof item === 'object'
+        ? (item.userId || item.user_id || item.qq || item.id)
+        : item,
+    );
+    if (userId) return userId;
+  }
   const match = msg && msg.message ? msg.message.match(/\[CQ:at,qq=(\d+)\]/) : null;
   return match ? match[1] : '';
 }
@@ -685,7 +700,7 @@ cmdRace.solve = async (ctx, msg, cmdArgs) => {
   const orderStart = isBet ? 3 : 2;
   const orderParts = collectArgs(cmdArgs, orderStart).filter((item) => !item.includes('[CQ:at,'));
   const order = orderParts.join('');
-  const opponentKey = extractAtQQ(msg);
+  const opponentKey = extractAtQQ(msg, cmdArgs);
   if (!order) {
     seal.replyToSender(ctx, msg, isBet ? '用法：.马赛 下注 50 上中下' : '用法：.马赛 出战 上中下');
     return seal.ext.newCmdExecuteResult(true);
@@ -717,7 +732,7 @@ cmdRaceBet.solve = async (ctx, msg, cmdArgs) => {
     seal.replyToSender(ctx, msg, cmdRaceBet.help);
     return seal.ext.newCmdExecuteResult(true);
   }
-  await runRaceAndReply(ctx, msg, order, extractAtQQ(msg), betAmount);
+  await runRaceAndReply(ctx, msg, order, extractAtQQ(msg, cmdArgs), betAmount);
   return seal.ext.newCmdExecuteResult(true);
 };
 
