@@ -122,6 +122,85 @@ function formatTeamSlots(team) {
   }).join('\n');
 }
 
+function economyUserId(ctx, msg) {
+  if (ctx && ctx.player && ctx.player.userId) return ctx.player.userId;
+  if (msg && msg.sender && msg.sender.userId) return msg.sender.userId;
+  if (msg && msg.sender && msg.sender.user_id) return msg.sender.user_id;
+  const key = playerKey(ctx);
+  return key ? `QQ:${key}` : '';
+}
+
+function getEconomyExt() {
+  const economy = seal.ext.find('slot-economy');
+  if (!economy || typeof economy.storageGet !== 'function' || typeof economy.storageSet !== 'function') {
+    return null;
+  }
+  return economy;
+}
+
+function economyStorageGetInt(economy, key, fallback) {
+  const raw = economy.storageGet(key);
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const value = Number.parseInt(String(raw), 10);
+  return Number.isSafeInteger(value) ? value : fallback;
+}
+
+function economyStorageSetInt(economy, key, value) {
+  economy.storageSet(key, String(Math.max(0, Math.floor(Number(value) || 0))));
+}
+
+function economyWalletKey(userId) {
+  return `wallet:${userId}`;
+}
+
+function economyDebtKey(userId) {
+  return `debt:${userId}`;
+}
+
+function economyWorkStartKey(userId) {
+  return `workStart:${userId}`;
+}
+
+function economyGetWallet(economy, userId) {
+  return economyStorageGetInt(economy, economyWalletKey(userId), 0);
+}
+
+function economySetWallet(economy, userId, amount) {
+  economyRememberUser(economy, userId);
+  economyStorageSetInt(economy, economyWalletKey(userId), amount);
+}
+
+function economyCurrency(economy) {
+  try {
+    const value = seal.ext.getStringConfig(economy, '货币名');
+    if (typeof value === 'string' && value.length > 0) return value;
+  } catch (e) {}
+  return '金币';
+}
+
+function economyRememberUser(economy, userId, name) {
+  if (!userId) return;
+  let users = [];
+  const raw = economy.storageGet('walletUsers');
+  if (raw) {
+    try {
+      const parsed = JSON.parse(String(raw));
+      if (Array.isArray(parsed)) users = parsed.map((item) => String(item));
+    } catch (e) {}
+  }
+  if (!users.includes(userId)) {
+    users.push(userId);
+    economy.storageSet('walletUsers', JSON.stringify(users));
+  }
+  if (name) economy.storageSet(`walletName:${userId}`, name);
+}
+
+function parseBetAmount(value) {
+  const amount = Number.parseInt(String(value || '').replace(/[^\d]/g, ''), 10);
+  if (!Number.isSafeInteger(amount) || amount <= 0) return 0;
+  return amount;
+}
+
 function saveCocExcelFile(ctx, msg, file) {
   const groupId = normalizeGroupId(
     (msg && msg.groupId) || (ctx && ctx.group && ctx.group.groupId) || (file && file.group_id),
@@ -448,7 +527,88 @@ cmdRace.name = '马赛';
 cmdRace.help = `马赛：
 .马赛 出战 上中下
 .马赛 出战 下 上 中
-.马赛 出战 下上中 @对方`;
+.马赛 出战 下上中 @对方
+.马赛 下注 50 上中下
+.赌马 50 下上中 @对方`;
+
+async function runRaceAndReply(ctx, msg, order, opponentKey, betAmount) {
+  const params = {
+    user_key: playerKey(ctx),
+    group_id: plainGroupId(ctx),
+    user_name: playerName(ctx),
+    order,
+    opponent_key: opponentKey,
+    opponent_name: opponentKey ? `玩家${opponentKey}` : '',
+  };
+
+  let economy = null;
+  let economyId = '';
+  let balanceBefore = 0;
+  let currency = '金币';
+
+  if (betAmount > 0) {
+    economy = getEconomyExt();
+    if (!economy) {
+      seal.replyToSender(ctx, msg, '赌马需要先启用 dc模拟器。');
+      return;
+    }
+    economyId = economyUserId(ctx, msg);
+    if (!economyId) {
+      seal.replyToSender(ctx, msg, '没有拿到你的钱包 ID。');
+      return;
+    }
+    currency = economyCurrency(economy);
+    economyRememberUser(economy, economyId, playerName(ctx));
+    const workStart = economyStorageGetInt(economy, economyWorkStartKey(economyId), 0);
+    if (workStart > 0) {
+      seal.replyToSender(ctx, msg, '你正在打工，不能赌马。');
+      return;
+    }
+    const debt = economyStorageGetInt(economy, economyDebtKey(economyId), 0);
+    if (debt > 0) {
+      seal.replyToSender(ctx, msg, `你还有欠债 ${debt}${currency}，先还债再赌马。`);
+      return;
+    }
+    balanceBefore = economyGetWallet(economy, economyId);
+    if (balanceBefore < betAmount) {
+      seal.replyToSender(ctx, msg, `余额不足，当前余额：${balanceBefore}${currency}。本次下注需要：${betAmount}${currency}。`);
+      return;
+    }
+    economySetWallet(economy, economyId, balanceBefore - betAmount);
+  }
+
+  try {
+    seal.replyToSender(ctx, msg, betAmount > 0 ? `下注成功：${betAmount}${currency}。马赛开跑，请稍候。` : '马赛开跑，请稍候。');
+    const result = await backendGet('/race/run', params);
+    if (result.status !== 'ok') {
+      if (betAmount > 0) economySetWallet(economy, economyId, balanceBefore);
+      seal.replyToSender(ctx, msg, `失败：${result.msg}`);
+      return;
+    }
+    const lines = (result.rounds || []).map((item) => item.text).join('\n');
+    const imgUrl = `${backendBase()}/get_img?title=${encodeURIComponent(result.img)}&t=${Date.now()}`;
+    let betText = '';
+    if (betAmount > 0) {
+      if (result.winner_side === 'user') {
+        const payout = betAmount * 2;
+        const balance = economyGetWallet(economy, economyId) + payout;
+        economySetWallet(economy, economyId, balance);
+        betText = `\n赌马结算：赢。返还 ${payout}${currency}。当前余额：${balance}${currency}。`;
+      } else {
+        const balance = economyGetWallet(economy, economyId);
+        betText = `\n赌马结算：输。扣除 ${betAmount}${currency}。当前余额：${balance}${currency}。`;
+      }
+    }
+    seal.replyToSender(
+      ctx,
+      msg,
+      `马赛结束。\n比分：${result.score}\n胜者：${result.winner}\n对手：${result.opponent_name}\n${lines}${betText}\n[CQ:image,file=${imgUrl},cache=0]`,
+    );
+  } catch (e) {
+    if (betAmount > 0) economySetWallet(economy, economyId, balanceBefore);
+    seal.replyToSender(ctx, msg, `马赛错误：${e.message}`);
+  }
+}
 
 cmdRace.solve = async (ctx, msg, cmdArgs) => {
   const groupId = plainGroupId(ctx);
@@ -458,44 +618,54 @@ cmdRace.solve = async (ctx, msg, cmdArgs) => {
   }
 
   const sub = (cmdArgs.getArgN(1) || '').toLowerCase();
-  if (sub !== '出战' && sub !== 'run') {
+  if (sub !== '出战' && sub !== 'run' && sub !== '下注' && sub !== '赌马' && sub !== 'bet') {
     seal.replyToSender(ctx, msg, cmdRace.help);
     return seal.ext.newCmdExecuteResult(true);
   }
 
-  const orderParts = collectArgs(cmdArgs, 2).filter((item) => !item.includes('[CQ:at,'));
+  const isBet = sub === '下注' || sub === '赌马' || sub === 'bet';
+  const betAmount = isBet ? parseBetAmount(cmdArgs.getArgN(2)) : 0;
+  if (isBet && betAmount <= 0) {
+    seal.replyToSender(ctx, msg, '用法：.马赛 下注 50 上中下');
+    return seal.ext.newCmdExecuteResult(true);
+  }
+  const orderStart = isBet ? 3 : 2;
+  const orderParts = collectArgs(cmdArgs, orderStart).filter((item) => !item.includes('[CQ:at,'));
   const order = orderParts.join('');
   const opponentKey = extractAtQQ(msg);
   if (!order) {
-    seal.replyToSender(ctx, msg, '用法：.马赛 出战 上中下');
+    seal.replyToSender(ctx, msg, isBet ? '用法：.马赛 下注 50 上中下' : '用法：.马赛 出战 上中下');
     return seal.ext.newCmdExecuteResult(true);
   }
 
-  try {
-    seal.replyToSender(ctx, msg, '马赛开跑，请稍候。');
-    const result = await backendGet('/race/run', {
-      user_key: playerKey(ctx),
-      group_id: groupId,
-      user_name: playerName(ctx),
-      order,
-      opponent_key: opponentKey,
-      opponent_name: opponentKey ? `玩家${opponentKey}` : '',
-    });
-    if (result.status !== 'ok') {
-      seal.replyToSender(ctx, msg, `失败：${result.msg}`);
-      return seal.ext.newCmdExecuteResult(true);
-    }
-    const lines = (result.rounds || []).map((item) => item.text).join('\n');
-    const imgUrl = `${backendBase()}/get_img?title=${encodeURIComponent(result.img)}&t=${Date.now()}`;
-    seal.replyToSender(
-      ctx,
-      msg,
-      `马赛结束。\n比分：${result.score}\n胜者：${result.winner}\n对手：${result.opponent_name}\n${lines}\n[CQ:image,file=${imgUrl},cache=0]`,
-    );
-  } catch (e) {
-    seal.replyToSender(ctx, msg, `马赛错误：${e.message}`);
-  }
+  await runRaceAndReply(ctx, msg, order, opponentKey, betAmount);
   return seal.ext.newCmdExecuteResult(true);
 };
 
 ext.cmdMap['马赛'] = cmdRace;
+
+const cmdRaceBet = seal.ext.newCmdItemInfo();
+cmdRaceBet.name = '赌马';
+cmdRaceBet.help = '赌马下注并出战。\n用法：.赌马 50 上中下 / .赌马 50 下上中 @对方';
+cmdRaceBet.solve = async (ctx, msg, cmdArgs) => {
+  const groupId = plainGroupId(ctx);
+  if (!groupId) {
+    seal.replyToSender(ctx, msg, '赌马仅限群聊使用。');
+    return seal.ext.newCmdExecuteResult(true);
+  }
+  const betAmount = parseBetAmount(cmdArgs.getArgN(1));
+  if (betAmount <= 0) {
+    seal.replyToSender(ctx, msg, cmdRaceBet.help);
+    return seal.ext.newCmdExecuteResult(true);
+  }
+  const orderParts = collectArgs(cmdArgs, 2).filter((item) => !item.includes('[CQ:at,'));
+  const order = orderParts.join('');
+  if (!order) {
+    seal.replyToSender(ctx, msg, cmdRaceBet.help);
+    return seal.ext.newCmdExecuteResult(true);
+  }
+  await runRaceAndReply(ctx, msg, order, extractAtQQ(msg), betAmount);
+  return seal.ext.newCmdExecuteResult(true);
+};
+
+ext.cmdMap['赌马'] = cmdRaceBet;

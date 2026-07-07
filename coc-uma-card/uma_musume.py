@@ -1129,6 +1129,7 @@ def run_race(
         "img": race["img"],
         "score": race["score"],
         "winner": race["winner"],
+        "winner_side": race["winner_side"],
         "opponent_key": opponent_key,
         "opponent_name": race["opponent_name"],
         "rounds": [
