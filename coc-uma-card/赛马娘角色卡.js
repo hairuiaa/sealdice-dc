@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         COC角色卡转赛马娘育成卡
 // @author       Air, Codex
-// @version      1.0.4
+// @version      1.0.5
 // @description  上传 Excel 格式 COC 角色卡后，用 .赛马娘 生成赛马娘风格育成卡
 // @timestamp    1783468800
 // @license      MIT
@@ -9,7 +9,7 @@
 
 let ext = seal.ext.find('coc-uma-card');
 if (!ext) {
-  ext = seal.ext.new('coc-uma-card', 'Air, Codex', '1.0.0');
+  ext = seal.ext.new('coc-uma-card', 'Air, Codex', '1.0.5');
   seal.ext.register(ext);
 }
 
@@ -49,6 +49,21 @@ const APTITUDE_LABELS = {
   mental: '精神',
   luck: '运气',
 };
+
+const UMA_HELP_TEXT = `赛马娘玩法：
+.赛马娘
+.马房 列表
+.马房 详情 <卡名>
+.马房 删除 <卡名>
+.丢掉马儿 <卡名>
+.马队 设置 上等 <卡名>
+.马队 设置 中等 <卡名>
+.马队 设置 下等 <卡名>
+.马队 列表
+.马赛 出战 上中下
+.马赛 出战 下上中 @对方
+.马赛 下注 50 上中下
+.赌马 50 下上中 @对方`;
 
 function normalizeGroupId(groupId) {
   if (!groupId) return '';
@@ -415,7 +430,18 @@ cmdStable.name = '马房';
 cmdStable.help = `马房：
 .马房 列表
 .马房 详情 <卡名>
-.马房 删除 <卡名>`;
+.马房 删除 <卡名>
+.丢掉马儿 <卡名>`;
+
+async function removeStableCardAndReply(ctx, msg, name) {
+  const cardName = String(name || '').trim();
+  if (!cardName) {
+    seal.replyToSender(ctx, msg, '用法：.丢掉马儿 <卡名>');
+    return;
+  }
+  const result = await backendGet('/stable/remove', { user_key: playerKey(ctx), name: cardName });
+  seal.replyToSender(ctx, msg, result.status === 'ok' ? result.msg : `失败：${result.msg}`);
+}
 
 cmdStable.solve = async (ctx, msg, cmdArgs) => {
   const userKey = playerKey(ctx);
@@ -454,8 +480,7 @@ cmdStable.solve = async (ctx, msg, cmdArgs) => {
         seal.replyToSender(ctx, msg, '用法：.马房 删除 <卡名>');
         return seal.ext.newCmdExecuteResult(true);
       }
-      const result = await backendGet('/stable/remove', { user_key: userKey, name });
-      seal.replyToSender(ctx, msg, result.status === 'ok' ? result.msg : `失败：${result.msg}`);
+      await removeStableCardAndReply(ctx, msg, name);
     } else {
       seal.replyToSender(ctx, msg, cmdStable.help);
     }
@@ -466,6 +491,34 @@ cmdStable.solve = async (ctx, msg, cmdArgs) => {
 };
 
 ext.cmdMap['马房'] = cmdStable;
+
+const cmdDropHorse = seal.ext.newCmdItemInfo();
+cmdDropHorse.name = '丢掉马儿';
+cmdDropHorse.help = '从马房删除一张马卡。\n用法：.丢掉马儿 <卡名>';
+cmdDropHorse.solve = async (ctx, msg, cmdArgs) => {
+  const name = collectArgs(cmdArgs, 1).join(' ').trim();
+  try {
+    await removeStableCardAndReply(ctx, msg, name);
+  } catch (e) {
+    seal.replyToSender(ctx, msg, `丢掉马儿错误：${e.message}`);
+  }
+  return seal.ext.newCmdExecuteResult(true);
+};
+
+ext.cmdMap['丢掉马儿'] = cmdDropHorse;
+ext.cmdMap['丢掉马'] = cmdDropHorse;
+
+const cmdUmaHelp = seal.ext.newCmdItemInfo();
+cmdUmaHelp.name = '马娘help';
+cmdUmaHelp.help = UMA_HELP_TEXT;
+cmdUmaHelp.solve = (ctx, msg) => {
+  seal.replyToSender(ctx, msg, UMA_HELP_TEXT);
+  return seal.ext.newCmdExecuteResult(true);
+};
+
+ext.cmdMap['马娘help'] = cmdUmaHelp;
+ext.cmdMap['马娘帮助'] = cmdUmaHelp;
+ext.cmdMap['umahelp'] = cmdUmaHelp;
 
 const cmdHorseTeam = seal.ext.newCmdItemInfo();
 cmdHorseTeam.name = '马队';
