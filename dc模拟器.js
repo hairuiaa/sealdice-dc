@@ -1,21 +1,21 @@
 // ==UserScript==
 // @name         dc模拟器
 // @author       hairuiaa+codex
-// @version      1.6.0
-// @description  带每日低保、打工、转盘、老虎机、买大小和管理工具的经济插件。
+// @version      1.7.0
+// @description  带每日低保、打工、转盘、老虎机、买大小、俄罗斯轮盘和管理工具的经济插件。
 // @timestamp    1783334400
 // @license      Apache-2.0
 // ==/UserScript==
 
 let ext = seal.ext.find('slot-economy');
 if (!ext) {
-  ext = seal.ext.new('slot-economy', 'hairuiaa+codex', '1.6.0');
+  ext = seal.ext.new('slot-economy', 'hairuiaa+codex', '1.7.0');
   seal.ext.register(ext);
 }
 
 try {
     if (seal.ext.unregisterConfig) {
-        seal.ext.unregisterConfig(ext, "无奖权重", "小奖权重", "大奖权重", "21点消息间隔秒");
+        seal.ext.unregisterConfig(ext, "无奖权重", "小奖权重", "大奖权重", "21点消息间隔秒", "单人轮盘倍率表");
     }
 } catch (e) {}
 
@@ -46,6 +46,11 @@ seal.ext.registerIntConfig(ext, "买大小默认下注", 10, "使用 .买大 或
 seal.ext.registerIntConfig(ext, "买大小最小下注", 1, "买大小允许的最小下注金额。");
 seal.ext.registerIntConfig(ext, "买大小最大下注", 1000, "买大小允许的最大下注金额。");
 seal.ext.registerFloatConfig(ext, "买大小返还倍率", 2.0, "买大小买中时的返还倍率，包含本金。");
+seal.ext.registerIntConfig(ext, "轮盘默认下注", 10, "使用 .轮盘 单人 或 .轮盘 多人 时的默认下注金额。");
+seal.ext.registerIntConfig(ext, "轮盘最小下注", 1, "俄罗斯轮盘允许的最小下注金额。");
+seal.ext.registerIntConfig(ext, "轮盘最大下注", 1000, "俄罗斯轮盘允许的最大下注金额。");
+seal.ext.registerIntConfig(ext, "多人轮盘报名秒", 60, "多人轮盘开局后允许加入的秒数。");
+seal.ext.registerIntConfig(ext, "多人轮盘最少人数", 2, "多人轮盘至少需要多少人才能开始。");
 seal.ext.registerIntConfig(ext, "21点默认下注", 10, "使用 .21点 或 .bj 时的默认下注金额。");
 seal.ext.registerIntConfig(ext, "21点最小下注", 10, "21点允许的最小下注金额。");
 seal.ext.registerIntConfig(ext, "21点最大下注", 10000, "21点允许的最大下注金额。");
@@ -967,6 +972,820 @@ function getBigSmallHelpText() {
     ].join("\n");
 }
 
+function getRouletteScopeId(ctx, msg, userId) {
+    const groupId = getGroupId(ctx, msg);
+    if (groupId) return groupId;
+    return `private:${userId}`;
+}
+
+function getRouletteSoloRoundKey(scopeId, userId) {
+    return `rouletteSolo:${scopeId}:${userId}`;
+}
+
+function getRouletteMultiRoundKey(groupId) {
+    return `rouletteMulti:${groupId}`;
+}
+
+function getRouletteBetLimits() {
+    const defaultBet = Math.max(1, getIntConfig("轮盘默认下注", 10));
+    const minBet = Math.max(1, getIntConfig("轮盘最小下注", 1));
+    const maxBet = Math.max(minBet, getIntConfig("轮盘最大下注", 1000));
+    return { defaultBet, minBet, maxBet };
+}
+
+function parseRouletteBetAmount(text) {
+    const currency = getStringConfig("货币名", "金币");
+    const limits = getRouletteBetLimits();
+    const raw = String(text || "").trim();
+    const amountText = raw || String(limits.defaultBet);
+    if (!/^\d+$/.test(amountText)) {
+        return { ok: false, reason: "下注金额必须是数字。\n示例：.轮盘 单人 50" };
+    }
+
+    const amount = Number.parseInt(amountText, 10);
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+        return { ok: false, reason: "下注金额必须大于 0。" };
+    }
+    if (amount < limits.minBet) {
+        return { ok: false, reason: `下注金额不能低于 ${limits.minBet}${currency}。` };
+    }
+    if (amount > limits.maxBet) {
+        return { ok: false, reason: `下注金额不能高于 ${limits.maxBet}${currency}。` };
+    }
+    return { ok: true, amount };
+}
+
+function getRouletteJoinSeconds() {
+    return Math.max(1, getIntConfig("多人轮盘报名秒", 60));
+}
+
+function getRouletteMinPlayers() {
+    return Math.max(2, getIntConfig("多人轮盘最少人数", 2));
+}
+
+function normalizeRouletteSoloRound(round) {
+    if (!round || round.rulesVersion !== 1 || round.mode !== "solo") return null;
+    round.bet = Math.max(0, Math.floor(Number(round.bet) || 0));
+    round.pot = Math.max(round.bet * 2, Math.floor(Number(round.pot) || 0));
+    round.bulletIndex = Math.floor(Number(round.bulletIndex));
+    if (!Number.isSafeInteger(round.bulletIndex) || round.bulletIndex < 0 || round.bulletIndex > 5) round.bulletIndex = randomInt(6);
+    round.shotIndex = Math.max(0, Math.min(6, Math.floor(Number(round.shotIndex) || 0)));
+    round.safeCount = Math.max(0, Math.floor(Number(round.safeCount) || 0));
+    round.dealerSafeCount = Math.max(0, Math.floor(Number(round.dealerSafeCount) || 0));
+    round.playerCanPass = Boolean(round.playerCanPass);
+    round.currentTurn = round.currentTurn === "dealer" ? "dealer" : "player";
+    round.dealerName = String(round.dealerName || "骰娘");
+    round.startedAt = Math.floor(Number(round.startedAt) || Date.now());
+    round.updatedAt = Math.floor(Number(round.updatedAt) || Date.now());
+    return round;
+}
+
+function getRouletteSoloRound(scopeId, userId) {
+    return normalizeRouletteSoloRound(storageGetJsonObject(getRouletteSoloRoundKey(scopeId, userId)));
+}
+
+function setRouletteSoloRound(scopeId, userId, round) {
+    round.updatedAt = Date.now();
+    storageSetJsonObject(getRouletteSoloRoundKey(scopeId, userId), round);
+}
+
+function clearRouletteSoloRound(scopeId, userId) {
+    ext.storageSet(getRouletteSoloRoundKey(scopeId, userId), "");
+}
+
+function normalizeRouletteMultiPlayer(player) {
+    const value = player && typeof player === "object" ? player : {};
+    return {
+        userId: normalizeUserId(value.userId),
+        name: String(value.name || value.userId || "玩家"),
+        bet: Math.max(0, Math.floor(Number(value.bet) || 0)),
+        alive: value.alive !== false,
+        safeCount: Math.max(0, Math.floor(Number(value.safeCount) || 0)),
+        joinedAt: Math.floor(Number(value.joinedAt) || Date.now()),
+        eliminatedAt: Math.floor(Number(value.eliminatedAt) || 0),
+    };
+}
+
+function normalizeRouletteMultiRound(round, groupId) {
+    if (!round || round.rulesVersion !== 1 || round.mode !== "multi" || round.groupId !== groupId) return null;
+    round.phase = round.phase === "playing" ? "playing" : "joining";
+    round.bet = Math.max(0, Math.floor(Number(round.bet) || 0));
+    round.pot = Math.max(0, Math.floor(Number(round.pot) || 0));
+    round.bulletIndex = Math.floor(Number(round.bulletIndex));
+    if (!Number.isSafeInteger(round.bulletIndex) || round.bulletIndex < 0 || round.bulletIndex > 5) round.bulletIndex = randomInt(6);
+    round.shotIndex = Math.max(0, Math.min(6, Math.floor(Number(round.shotIndex) || 0)));
+    round.currentIndex = Math.max(0, Math.floor(Number(round.currentIndex) || 0));
+    round.turnNumber = Math.max(0, Math.floor(Number(round.turnNumber) || 0));
+    round.startedAt = Math.floor(Number(round.startedAt) || Date.now());
+    round.joinEndAt = Math.floor(Number(round.joinEndAt) || Date.now());
+    round.updatedAt = Math.floor(Number(round.updatedAt) || Date.now());
+    round.players = Array.isArray(round.players) ? round.players.map(normalizeRouletteMultiPlayer).filter(player => player.userId) : [];
+    return round;
+}
+
+function getRouletteMultiRound(groupId) {
+    return normalizeRouletteMultiRound(storageGetJsonObject(getRouletteMultiRoundKey(groupId)), groupId);
+}
+
+function setRouletteMultiRound(groupId, round) {
+    round.updatedAt = Date.now();
+    storageSetJsonObject(getRouletteMultiRoundKey(groupId), round);
+}
+
+function clearRouletteMultiRound(groupId) {
+    ext.storageSet(getRouletteMultiRoundKey(groupId), "");
+}
+
+function getRouletteAlivePlayers(round) {
+    return (round.players || []).filter(player => player.alive !== false);
+}
+
+function findRoulettePlayer(round, userId) {
+    return (round.players || []).find(player => player.userId === userId) || null;
+}
+
+function getRouletteCurrentPlayer(round) {
+    const players = round.players || [];
+    if (players.length <= 0) return null;
+    for (let offset = 0; offset < players.length; offset += 1) {
+        const index = (round.currentIndex + offset) % players.length;
+        const player = players[index];
+        if (player && player.alive !== false) {
+            round.currentIndex = index;
+            return player;
+        }
+    }
+    return null;
+}
+
+function getNextRouletteAliveIndex(round, afterIndex) {
+    const players = round.players || [];
+    if (players.length <= 0) return 0;
+    for (let offset = 1; offset <= players.length; offset += 1) {
+        const index = (afterIndex + offset) % players.length;
+        const player = players[index];
+        if (player && player.alive !== false) return index;
+    }
+    return 0;
+}
+
+function formatRoulettePlayerNames(players) {
+    const names = (players || []).map(player => player.name || player.userId).filter(Boolean);
+    if (names.length <= 0) return "无";
+    return names.join(" / ");
+}
+
+function getRouletteHelpText() {
+    const currency = getStringConfig("货币名", "金币");
+    const limits = getRouletteBetLimits();
+    const seconds = getRouletteJoinSeconds();
+    const minPlayers = getRouletteMinPlayers();
+    return [
+        "道具俄罗斯轮盘",
+        ".轮盘 单人 50 / .rr solo 50：和骰娘开单人对局",
+        ".轮盘 继续 / .rr fire：玩家扣动道具扳机",
+        ".轮盘 换人 / .rr pass：骰娘扣动道具扳机，然后交回玩家",
+        ".轮盘 多人 50 / .rr multi 50：开多人报名",
+        ".轮盘 加入 / .rr join：加入本群多人局",
+        ".轮盘 开始 / .rr start：房主提前开始多人局",
+        ".轮盘 状态 / .rr status：查看当前局",
+        ".轮盘 结束 / .rr end：结束单人局，或由房主/管理员关闭多人局并退款",
+        "单人奖池：玩家下注，骰娘跟同额虚拟注，幸存者拿走奖池",
+        `多人报名：${seconds}秒，至少 ${minPlayers} 人`,
+        `默认下注：${limits.defaultBet}${currency}`,
+        `下注范围：${limits.minBet}-${limits.maxBet}${currency}`,
+    ].join("\n");
+}
+
+function getRouletteSoloStatusText(round) {
+    const currency = getStringConfig("货币名", "金币");
+    const remaining = Math.max(0, 6 - Math.max(0, Math.floor(Number(round.shotIndex) || 0)));
+    const turnName = round.currentTurn === "dealer" ? round.dealerName : (round.playerName || round.userId);
+    const lines = [
+        "🎲 【单人道具轮盘】",
+        `玩家：${round.playerName || round.userId}`,
+        `对手：${round.dealerName || "骰娘"}`,
+        `下注：${round.bet}${currency}`,
+        `奖池：${round.pot}${currency}`,
+        `已扣动：${round.shotIndex}/6`,
+        `剩余格数：${remaining}`,
+        `玩家安全次数：${round.safeCount}`,
+        `骰娘安全次数：${round.dealerSafeCount}`,
+        `当前轮到：${turnName}`,
+    ];
+    lines.push(round.playerCanPass ? "操作：.轮盘 继续 / .轮盘 换人" : "操作：.轮盘 继续");
+    return lines.join("\n");
+}
+
+function getRouletteMultiStatusText(round) {
+    const currency = getStringConfig("货币名", "金币");
+    const alivePlayers = getRouletteAlivePlayers(round);
+    if (round.phase === "joining") {
+        const remaining = Math.max(0, Math.ceil((Number(round.joinEndAt || 0) - Date.now()) / 1000));
+        return [
+            "🎲 【多人道具轮盘报名】",
+            `房主：${round.ownerName || round.ownerId}`,
+            `下注：${round.bet}${currency}`,
+            `奖池：${round.pot}${currency}`,
+            `人数：${round.players.length}/${getRouletteMinPlayers()}+`,
+            `剩余报名：${remaining}秒`,
+            `已加入：${formatRoulettePlayerNames(round.players)}`,
+            "加入：.轮盘 加入",
+            "提前开始：.轮盘 开始",
+        ].join("\n");
+    }
+
+    const current = getRouletteCurrentPlayer(round);
+    return [
+        "🎲 【多人道具轮盘】",
+        `奖池：${round.pot}${currency}`,
+        `存活：${alivePlayers.length}/${round.players.length}`,
+        `已扣动：${round.shotIndex}/6`,
+        `剩余格数：${Math.max(0, 6 - round.shotIndex)}`,
+        `当前行动：${current ? current.name : "无"}`,
+        `存活玩家：${formatRoulettePlayerNames(alivePlayers)}`,
+        "行动：.轮盘 扳机",
+    ].join("\n");
+}
+
+function replyRouletteUseBlocked(ctx, msg, userId, actionText) {
+    if (replyWorkBlocked(ctx, msg, userId, actionText)) return true;
+    return replyDebtBlocked(ctx, msg, userId, actionText);
+}
+
+function startRouletteSoloRound(ctx, msg, scopeId, userId, playerName, amountText) {
+    const currency = getStringConfig("货币名", "金币");
+    if (replyRouletteUseBlocked(ctx, msg, userId, "玩轮盘")) return;
+
+    const existing = getRouletteSoloRound(scopeId, userId);
+    if (existing) {
+        seal.replyToSender(ctx, msg, getRouletteSoloStatusText(existing));
+        return;
+    }
+
+    const bet = parseRouletteBetAmount(amountText);
+    if (!bet.ok) {
+        seal.replyToSender(ctx, msg, bet.reason);
+        return;
+    }
+
+    const balance = getWallet(userId);
+    if (balance < bet.amount) {
+        seal.replyToSender(ctx, msg, [
+            `余额不足，当前余额：${balance}${currency}`,
+            `本次下注需要：${bet.amount}${currency}`,
+            "可以使用 .低保 领取每日低保。",
+        ].join("\n"));
+        return;
+    }
+
+    setWallet(userId, balance - bet.amount);
+    const round = {
+        rulesVersion: 1,
+        mode: "solo",
+        scopeId,
+        userId,
+        playerName,
+        dealerName: "骰娘",
+        bet: bet.amount,
+        pot: bet.amount * 2,
+        bulletIndex: randomInt(6),
+        shotIndex: 0,
+        safeCount: 0,
+        dealerSafeCount: 0,
+        playerCanPass: false,
+        currentTurn: "player",
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+    };
+    setRouletteSoloRound(scopeId, userId, round);
+
+    seal.replyToSender(ctx, msg, [
+        "🎲 【单人道具轮盘开局】",
+        `玩家：${playerName}`,
+        "对手：骰娘",
+        `双方下注：${bet.amount}${currency}`,
+        `奖池：${bet.amount * 2}${currency}`,
+        "六格弹仓，五格安全，一格失败。",
+        "弹巢只在开局旋转一次，之后连续推进。",
+        "玩家先行动。安全后可以继续，也可以换骰娘行动。",
+        "操作：.轮盘 继续",
+        `当前余额：${getWallet(userId)}${currency}`,
+    ].join("\n"));
+}
+
+function pullRouletteSoloTrigger(round, actor) {
+    const shotIndex = Math.max(0, Math.min(6, Math.floor(Number(round.shotIndex) || 0)));
+    const failed = shotIndex >= 6 || shotIndex === round.bulletIndex;
+    round.shotIndex = Math.min(6, shotIndex + 1);
+    if (!failed) {
+        if (actor === "dealer") round.dealerSafeCount += 1;
+        else round.safeCount += 1;
+    }
+    return {
+        failed,
+        shotNumber: shotIndex + 1,
+        remaining: Math.max(0, 6 - round.shotIndex),
+    };
+}
+
+function settleRouletteSoloRound(ctx, msg, scopeId, userId, round, winner, introLines) {
+    const currency = getStringConfig("货币名", "金币");
+    const lines = Array.isArray(introLines) ? introLines.slice() : [];
+    clearRouletteSoloRound(scopeId, userId);
+    if (winner === "player") {
+        setWallet(userId, getWallet(userId) + round.pot);
+        lines.push(`胜者：${round.playerName || userId}`);
+        lines.push(`奖池发放：${round.pot}${currency}`);
+    } else {
+        lines.push(`胜者：${round.dealerName || "骰娘"}`);
+        lines.push(`玩家失去下注：${round.bet}${currency}`);
+    }
+    lines.push(`当前余额：${getWallet(userId)}${currency}`);
+    seal.replyToSender(ctx, msg, lines.join("\n"));
+}
+
+function fireRouletteSoloRound(ctx, msg, scopeId, userId, round) {
+    if (round.currentTurn !== "player") {
+        seal.replyToSender(ctx, msg, "当前轮到骰娘。\n使用 .轮盘 换人 让骰娘扣动道具扳机。");
+        return;
+    }
+
+    const result = pullRouletteSoloTrigger(round, "player");
+    if (result.failed) {
+        settleRouletteSoloRound(ctx, msg, scopeId, userId, round, "dealer", [
+            "🎲 【单人道具轮盘结算】",
+            `${round.playerName || userId} 扣动道具扳机。`,
+            "失败格亮起。",
+            `落点：第 ${result.shotNumber} 格`,
+        ]);
+        return;
+    }
+
+    round.currentTurn = "player";
+    round.playerCanPass = true;
+    setRouletteSoloRound(scopeId, userId, round);
+    seal.replyToSender(ctx, msg, [
+        "🎲 【单人道具轮盘】",
+        `${round.playerName || userId} 扣动道具扳机。`,
+        "安全格停住。",
+        `落点：第 ${result.shotNumber} 格`,
+        `剩余格数：${result.remaining}`,
+        `玩家安全次数：${round.safeCount}`,
+        "继续：.轮盘 继续",
+        "换人：.轮盘 换人",
+    ].join("\n"));
+}
+
+function passRouletteSoloTurn(ctx, msg, scopeId, userId, round) {
+    if (!round.playerCanPass) {
+        seal.replyToSender(ctx, msg, "你需要先扣动一次道具扳机，安全后才能换人。");
+        return;
+    }
+
+    round.currentTurn = "dealer";
+    round.playerCanPass = false;
+    const result = pullRouletteSoloTrigger(round, "dealer");
+    if (result.failed) {
+        settleRouletteSoloRound(ctx, msg, scopeId, userId, round, "player", [
+            "🎲 【单人道具轮盘结算】",
+            `${round.dealerName || "骰娘"} 扣动道具扳机。`,
+            "失败格亮起。",
+            `落点：第 ${result.shotNumber} 格`,
+        ]);
+        return;
+    }
+
+    round.currentTurn = "player";
+    setRouletteSoloRound(scopeId, userId, round);
+    seal.replyToSender(ctx, msg, [
+        "🎲 【单人道具轮盘】",
+        `${round.dealerName || "骰娘"} 扣动道具扳机。`,
+        "安全格停住。",
+        `落点：第 ${result.shotNumber} 格`,
+        `剩余格数：${result.remaining}`,
+        `骰娘安全次数：${round.dealerSafeCount}`,
+        "轮到玩家。",
+        "操作：.轮盘 继续",
+    ].join("\n"));
+}
+
+function abandonRouletteSoloRound(ctx, msg, scopeId, userId, round) {
+    const currency = getStringConfig("货币名", "金币");
+    clearRouletteSoloRound(scopeId, userId);
+    seal.replyToSender(ctx, msg, [
+        "已结束单人道具轮盘。",
+        `本局下注已放弃：${round.bet}${currency}`,
+        `奖池关闭：${round.pot}${currency}`,
+        `当前余额：${getWallet(userId)}${currency}`,
+    ].join("\n"));
+}
+
+function refundRouletteMultiRound(round) {
+    let refundTotal = 0;
+    let refundCount = 0;
+    for (const player of round.players || []) {
+        const amount = Math.max(0, Math.floor(Number(player.bet) || 0));
+        if (!player.userId || amount <= 0) continue;
+        setWallet(player.userId, getWallet(player.userId) + amount);
+        refundTotal += amount;
+        refundCount += 1;
+    }
+    return { refundTotal, refundCount };
+}
+
+function scheduleRouletteMultiStart(ctx, msg, groupId, joinEndAt) {
+    if (typeof setTimeout !== "function") return;
+    const delay = Math.max(0, Number(joinEndAt || 0) - Date.now());
+    setTimeout(() => {
+        resolveExpiredRouletteMultiRound(ctx, msg, groupId, "auto");
+    }, delay);
+}
+
+function resolveExpiredRouletteMultiRound(ctx, msg, groupId, reason) {
+    const round = getRouletteMultiRound(groupId);
+    if (!round || round.phase !== "joining") return false;
+    if (Date.now() < Number(round.joinEndAt || 0)) return false;
+
+    const currency = getStringConfig("货币名", "金币");
+    const minPlayers = getRouletteMinPlayers();
+    if (round.players.length < minPlayers) {
+        const refunded = refundRouletteMultiRound(round);
+        clearRouletteMultiRound(groupId);
+        seal.replyToSender(ctx, msg, [
+            "🎲 【多人道具轮盘报名结束】",
+            `人数不足，需要至少 ${minPlayers} 人。`,
+            `已退还：${refunded.refundTotal}${currency}`,
+            `退款人数：${refunded.refundCount}`,
+        ].join("\n"));
+        return true;
+    }
+
+    startRouletteMultiPlaying(ctx, msg, groupId, round, reason === "auto" ? "报名时间到，游戏开始。" : "报名结束，游戏开始。");
+    return true;
+}
+
+function startRouletteMultiPlaying(ctx, msg, groupId, round, introText) {
+    round.phase = "playing";
+    round.currentIndex = 0;
+    round.turnNumber = 1;
+    round.startedAt = Date.now();
+    const current = getRouletteCurrentPlayer(round);
+    setRouletteMultiRound(groupId, round);
+    seal.replyToSender(ctx, msg, [
+        "🎲 【多人道具轮盘开始】",
+        introText,
+        `奖池：${round.pot}${getStringConfig("货币名", "金币")}`,
+        `玩家：${formatRoulettePlayerNames(round.players)}`,
+        `当前行动：${current ? current.name : "无"}`,
+        "行动：.轮盘 扳机",
+    ].join("\n"));
+}
+
+function startRouletteMultiRound(ctx, msg, groupId, userId, playerName, amountText) {
+    const currency = getStringConfig("货币名", "金币");
+    if (!groupId) {
+        seal.replyToSender(ctx, msg, "多人轮盘只能在群聊中使用。");
+        return;
+    }
+    if (replyRouletteUseBlocked(ctx, msg, userId, "开多人轮盘")) return;
+
+    const existing = getRouletteMultiRound(groupId);
+    if (existing) {
+        seal.replyToSender(ctx, msg, getRouletteMultiStatusText(existing));
+        return;
+    }
+
+    const scopeId = getRouletteScopeId(ctx, msg, userId);
+    if (getRouletteSoloRound(scopeId, userId)) {
+        seal.replyToSender(ctx, msg, "你当前已有单人轮盘，先完成或结束后再开多人局。");
+        return;
+    }
+
+    const bet = parseRouletteBetAmount(amountText);
+    if (!bet.ok) {
+        seal.replyToSender(ctx, msg, bet.reason);
+        return;
+    }
+
+    const balance = getWallet(userId);
+    if (balance < bet.amount) {
+        seal.replyToSender(ctx, msg, [
+            `余额不足，当前余额：${balance}${currency}`,
+            `本次下注需要：${bet.amount}${currency}`,
+            "可以使用 .低保 领取每日低保。",
+        ].join("\n"));
+        return;
+    }
+
+    setWallet(userId, balance - bet.amount);
+    const now = Date.now();
+    const joinSeconds = getRouletteJoinSeconds();
+    const round = {
+        rulesVersion: 1,
+        mode: "multi",
+        groupId,
+        ownerId: userId,
+        ownerName: playerName,
+        phase: "joining",
+        bet: bet.amount,
+        pot: bet.amount,
+        bulletIndex: randomInt(6),
+        shotIndex: 0,
+        currentIndex: 0,
+        turnNumber: 0,
+        startedAt: now,
+        joinEndAt: now + joinSeconds * 1000,
+        updatedAt: now,
+        players: [{
+            userId,
+            name: playerName,
+            bet: bet.amount,
+            alive: true,
+            safeCount: 0,
+            joinedAt: now,
+            eliminatedAt: 0,
+        }],
+    };
+    setRouletteMultiRound(groupId, round);
+    scheduleRouletteMultiStart(ctx, msg, groupId, round.joinEndAt);
+
+    seal.replyToSender(ctx, msg, [
+        "🎲 【多人道具轮盘报名】",
+        `房主：${playerName}`,
+        `每人下注：${bet.amount}${currency}`,
+        `报名时间：${joinSeconds}秒`,
+        `至少人数：${getRouletteMinPlayers()}`,
+        "加入：.轮盘 加入",
+        "提前开始：.轮盘 开始",
+        `当前奖池：${round.pot}${currency}`,
+    ].join("\n"));
+}
+
+function joinRouletteMultiRound(ctx, msg, groupId, userId, playerName) {
+    const currency = getStringConfig("货币名", "金币");
+    if (!groupId) {
+        seal.replyToSender(ctx, msg, "多人轮盘只能在群聊中使用。");
+        return;
+    }
+    if (resolveExpiredRouletteMultiRound(ctx, msg, groupId, "expired")) return;
+
+    const round = getRouletteMultiRound(groupId);
+    if (!round) {
+        seal.replyToSender(ctx, msg, "当前没有多人轮盘报名。\n使用 .轮盘 多人 50 开一局。");
+        return;
+    }
+    if (round.phase !== "joining") {
+        seal.replyToSender(ctx, msg, "多人轮盘已经开始，不能再加入。");
+        return;
+    }
+    if (findRoulettePlayer(round, userId)) {
+        seal.replyToSender(ctx, msg, "你已经加入本局多人轮盘。");
+        return;
+    }
+    if (replyRouletteUseBlocked(ctx, msg, userId, "加入多人轮盘")) return;
+
+    const scopeId = getRouletteScopeId(ctx, msg, userId);
+    if (getRouletteSoloRound(scopeId, userId)) {
+        seal.replyToSender(ctx, msg, "你当前已有单人轮盘，先完成或结束后再加入多人局。");
+        return;
+    }
+
+    const balance = getWallet(userId);
+    if (balance < round.bet) {
+        seal.replyToSender(ctx, msg, [
+            `余额不足，当前余额：${balance}${currency}`,
+            `加入需要：${round.bet}${currency}`,
+            "可以使用 .低保 领取每日低保。",
+        ].join("\n"));
+        return;
+    }
+
+    setWallet(userId, balance - round.bet);
+    round.players.push({
+        userId,
+        name: playerName,
+        bet: round.bet,
+        alive: true,
+        safeCount: 0,
+        joinedAt: Date.now(),
+        eliminatedAt: 0,
+    });
+    round.pot += round.bet;
+    setRouletteMultiRound(groupId, round);
+
+    const remaining = Math.max(0, Math.ceil((Number(round.joinEndAt || 0) - Date.now()) / 1000));
+    seal.replyToSender(ctx, msg, [
+        `加入成功：${playerName}`,
+        `当前人数：${round.players.length}`,
+        `当前奖池：${round.pot}${currency}`,
+        `剩余报名：${remaining}秒`,
+    ].join("\n"));
+}
+
+function manuallyStartRouletteMultiRound(ctx, msg, groupId, userId) {
+    if (!groupId) {
+        seal.replyToSender(ctx, msg, "多人轮盘只能在群聊中使用。");
+        return;
+    }
+    if (resolveExpiredRouletteMultiRound(ctx, msg, groupId, "expired")) return;
+
+    const round = getRouletteMultiRound(groupId);
+    if (!round) {
+        seal.replyToSender(ctx, msg, "当前没有多人轮盘报名。\n使用 .轮盘 多人 50 开一局。");
+        return;
+    }
+    if (round.phase !== "joining") {
+        seal.replyToSender(ctx, msg, getRouletteMultiStatusText(round));
+        return;
+    }
+    if (round.ownerId !== userId && !isEconomyAdmin(ctx)) {
+        seal.replyToSender(ctx, msg, "只有房主或海豹管理员可以提前开始。");
+        return;
+    }
+    const minPlayers = getRouletteMinPlayers();
+    if (round.players.length < minPlayers) {
+        seal.replyToSender(ctx, msg, `人数不足，至少需要 ${minPlayers} 人。`);
+        return;
+    }
+
+    startRouletteMultiPlaying(ctx, msg, groupId, round, "房主提前开始。");
+}
+
+function pullRouletteMultiTrigger(round) {
+    const shotIndex = Math.max(0, Math.min(6, Math.floor(Number(round.shotIndex) || 0)));
+    const failed = shotIndex >= 6 || shotIndex === round.bulletIndex;
+    round.shotIndex = Math.min(6, shotIndex + 1);
+    return {
+        failed,
+        shotNumber: shotIndex + 1,
+        remaining: Math.max(0, 6 - round.shotIndex),
+    };
+}
+
+function fireRouletteMultiRound(ctx, msg, groupId, userId, round) {
+    const currency = getStringConfig("货币名", "金币");
+    if (round.phase !== "playing") {
+        seal.replyToSender(ctx, msg, getRouletteMultiStatusText(round));
+        return;
+    }
+
+    const current = getRouletteCurrentPlayer(round);
+    if (!current) {
+        const refunded = refundRouletteMultiRound(round);
+        clearRouletteMultiRound(groupId);
+        seal.replyToSender(ctx, msg, `多人轮盘状态异常，已退款 ${refunded.refundTotal}${currency}。`);
+        return;
+    }
+    if (current.userId !== userId) {
+        seal.replyToSender(ctx, msg, [
+            `当前轮到：${current.name}`,
+            "请等待自己的回合。",
+        ].join("\n"));
+        return;
+    }
+
+    const currentIndex = round.currentIndex;
+    const result = pullRouletteMultiTrigger(round);
+    if (result.failed) {
+        current.alive = false;
+        current.eliminatedAt = Date.now();
+        const alivePlayers = getRouletteAlivePlayers(round);
+        if (alivePlayers.length <= 1) {
+            const winner = alivePlayers[0] || null;
+            if (winner) {
+                setWallet(winner.userId, getWallet(winner.userId) + round.pot);
+            }
+            clearRouletteMultiRound(groupId);
+            seal.replyToSender(ctx, msg, [
+                "🎲 【多人道具轮盘结算】",
+                `${current.name} 扣动道具扳机。`,
+                "失败格亮起。",
+                `落点：第 ${result.shotNumber} 格`,
+                winner ? `最后幸存者：${winner.name}` : "本局没有幸存者。",
+                winner ? `奖池发放：${round.pot}${currency}` : `奖池未发放：${round.pot}${currency}`,
+                winner ? `${winner.name} 当前余额：${getWallet(winner.userId)}${currency}` : "",
+            ].filter(Boolean).join("\n"));
+            return;
+        }
+
+        round.currentIndex = getNextRouletteAliveIndex(round, currentIndex);
+        round.turnNumber += 1;
+        setRouletteMultiRound(groupId, round);
+        const next = getRouletteCurrentPlayer(round);
+        seal.replyToSender(ctx, msg, [
+            "🎲 【多人道具轮盘】",
+            `${current.name} 扣动道具扳机。`,
+            "失败格亮起。",
+            `落点：第 ${result.shotNumber} 格`,
+            `${current.name} 出局。`,
+            `存活：${alivePlayers.length}/${round.players.length}`,
+            `下一位：${next ? next.name : "无"}`,
+        ].join("\n"));
+        return;
+    }
+
+    current.safeCount += 1;
+    round.currentIndex = getNextRouletteAliveIndex(round, currentIndex);
+    round.turnNumber += 1;
+    setRouletteMultiRound(groupId, round);
+    const next = getRouletteCurrentPlayer(round);
+    seal.replyToSender(ctx, msg, [
+        "🎲 【多人道具轮盘】",
+        `${current.name} 扣动道具扳机。`,
+        "安全格停住。",
+        `落点：第 ${result.shotNumber} 格`,
+        `剩余格数：${result.remaining}`,
+        `${current.name} 本局安全次数：${current.safeCount}`,
+        `下一位：${next ? next.name : "无"}`,
+        `奖池：${round.pot}${currency}`,
+    ].join("\n"));
+}
+
+function closeRouletteMultiRound(ctx, msg, groupId, userId, round) {
+    const currency = getStringConfig("货币名", "金币");
+    if (round.ownerId !== userId && !isEconomyAdmin(ctx)) {
+        seal.replyToSender(ctx, msg, "只有房主或海豹管理员可以关闭多人轮盘。");
+        return;
+    }
+
+    const refunded = refundRouletteMultiRound(round);
+    clearRouletteMultiRound(groupId);
+    seal.replyToSender(ctx, msg, [
+        "已关闭多人道具轮盘。",
+        `退款人数：${refunded.refundCount}`,
+        `退款合计：${refunded.refundTotal}${currency}`,
+    ].join("\n"));
+}
+
+function parseRouletteAction(cmdArgs) {
+    const text = parseInputText(cmdArgs).trim();
+    if (isHelpText(text)) return { action: "help", rest: "" };
+    if (!text) return { action: "help", rest: "" };
+
+    const parts = text.split(/\s+/);
+    const first = parts[0];
+    const firstLower = first.toLowerCase();
+    const rest = parts.slice(1).join(" ").trim();
+    if (/^\d+$/.test(first)) return { action: "soloStart", rest: text };
+
+    const exact = {
+        solo: "soloStart",
+        s: "soloStart",
+        "单人": "soloStart",
+        "个人": "soloStart",
+        multi: "multiStart",
+        m: "multiStart",
+        "多人": "multiStart",
+        "群": "multiStart",
+        join: "join",
+        "加入": "join",
+        "报名": "join",
+        start: "start",
+        "开始": "start",
+        fire: "fire",
+        pull: "fire",
+        go: "fire",
+        "继续": "fire",
+        "扳机": "fire",
+        "扣动": "fire",
+        pass: "pass",
+        next: "pass",
+        "换人": "pass",
+        "传给骰娘": "pass",
+        "给骰娘": "pass",
+        cash: "cash",
+        settle: "cash",
+        "收手": "cash",
+        "结算": "cash",
+        status: "status",
+        "状态": "status",
+        end: "end",
+        exit: "end",
+        "结束": "end",
+        "退出": "end",
+        "放弃": "end",
+    };
+    if (exact[firstLower]) return { action: exact[firstLower], rest };
+    if (exact[first]) return { action: exact[first], rest };
+
+    const prefixes = [
+        { prefix: "solo", action: "soloStart" },
+        { prefix: "单人", action: "soloStart" },
+        { prefix: "multi", action: "multiStart" },
+        { prefix: "多人", action: "multiStart" },
+    ];
+    for (const item of prefixes) {
+        const source = /^[a-z]+$/.test(item.prefix) ? firstLower : first;
+        if (source.startsWith(item.prefix) && source.length > item.prefix.length) {
+            const suffix = first.slice(item.prefix.length).trim();
+            return { action: item.action, rest: [suffix, rest].filter(Boolean).join(" ").trim() };
+        }
+    }
+
+    return { action: "unknown", rest: text };
+}
+
 function getLegacyBlackjackRoundKey(groupId) {
     return `blackjackRound:${groupId}`;
 }
@@ -1698,6 +2517,27 @@ function tokenizeArgsText(text) {
     return String(text || "").match(/\[CQ:[^\]]+\]|\S+/g) || [];
 }
 
+function normalizeMentionUserId(userId, senderId) {
+    const raw = normalizeUserId(userId);
+    if (!raw) return "";
+    if (/^\d{5,}$/.test(raw)) return userIdFromQQNumber(raw, senderId);
+    return raw;
+}
+
+function getMentionTargetUserIds(cmdArgs, senderId) {
+    const items = Array.isArray(cmdArgs && cmdArgs.at) ? cmdArgs.at : [];
+    const targets = [];
+    const skipFirst = Boolean(cmdArgs && cmdArgs.amIBeMentionedFirst);
+    for (let index = 0; index < items.length; index += 1) {
+        if (skipFirst && index === 0) continue;
+        const item = items[index] || {};
+        const raw = item.userId || item.userID || item.UserID || item.target || "";
+        const userId = normalizeMentionUserId(raw, senderId);
+        if (userId && targets.indexOf(userId) < 0) targets.push(userId);
+    }
+    return targets;
+}
+
 function userIdFromQQNumber(qq, senderId) {
     const normalizedQQ = String(qq || "").trim();
     const sender = String(senderId || "");
@@ -1743,9 +2583,10 @@ function parsePositiveInteger(text, label) {
     return { ok: true, amount: value };
 }
 
-function parseTargetAndAmount(text, senderId) {
+function parseTargetAndAmount(text, senderId, cmdArgs) {
     const tokens = tokenizeArgsText(text);
-    if (tokens.length < 2) {
+    const mentionTargets = getMentionTargetUserIds(cmdArgs, senderId);
+    if (tokens.length < 1 || (tokens.length < 2 && mentionTargets.length <= 0)) {
         return { ok: false, reason: "格式不对。\n示例：.转账 QQ:123456 50" };
     }
 
@@ -1754,7 +2595,7 @@ function parseTargetAndAmount(text, senderId) {
     if (!amount.ok) return amount;
 
     const targetToken = tokens.slice(0, tokens.length - 1).join(" ").trim();
-    const targetId = parseTargetUserId(targetToken, senderId);
+    const targetId = mentionTargets[0] || parseTargetUserId(targetToken, senderId);
     if (!targetId) return { ok: false, reason: "没有识别到目标玩家。\n推荐格式：.转账 QQ:123456 50" };
 
     return { ok: true, targetId, amount: amount.amount };
@@ -1858,9 +2699,9 @@ function makeConfirmCode() {
     return String(randomInt(9000) + 1000);
 }
 
-function parseWalletRegisterTargets(text, senderId) {
+function parseWalletRegisterTargets(text, senderId, cmdArgs) {
     const tokens = tokenizeArgsText(text);
-    const targets = [];
+    const targets = getMentionTargetUserIds(cmdArgs, senderId);
     for (const token of tokens) {
         const targetId = parseTargetUserId(token, senderId);
         if (targetId && targets.indexOf(targetId) < 0) targets.push(targetId);
@@ -1974,7 +2815,7 @@ function getHelpText() {
         `.打工：查看打工状态`,
         `.打工开始：开始打工`,
         `.打工结束：按完整分钟结算，每分钟 ${workIncome}${currency}`,
-        `打工期间不能玩老虎机、抽奖和买大小`,
+        `打工期间不能玩老虎机、抽奖、买大小和轮盘`,
         `.老虎机：投入默认金额 ${defaultBet}${currency}`,
         `.老虎机 50：投入 50${currency}`,
         `.老虎机50：投入 50${currency}`,
@@ -1983,6 +2824,7 @@ function getHelpText() {
         `.十连抽奖：连续抽 10 次，花费 ${lotteryCost * 10}${currency}`,
         `.买大小：开一局骰子买大小`,
         `.买大 50 / .买小50：下注买大或买小`,
+        `.轮盘 单人 50 / .轮盘 多人 50：道具俄罗斯轮盘`,
         `.加钱 / .一键共产：管理工具`,
         `.时髦值：查看当前时髦值`,
         `.时髦榜：查看本群时髦值前 10`,
@@ -2111,7 +2953,8 @@ cmdWalletRegister.solve = (ctx, msg, cmdArgs) => {
     }
 
     const currency = getStringConfig("货币名", "金币");
-    if (!inputText) {
+    const mentionTargets = getMentionTargetUserIds(cmdArgs, userId);
+    if (!inputText && mentionTargets.length <= 0) {
         rememberWalletUser(ctx, msg, userId);
         seal.replyToSender(ctx, msg, [
             "已登记你的钱包。",
@@ -2126,7 +2969,7 @@ cmdWalletRegister.solve = (ctx, msg, cmdArgs) => {
         return seal.ext.newCmdExecuteResult(true);
     }
 
-    const targets = parseWalletRegisterTargets(inputText, userId);
+    const targets = parseWalletRegisterTargets(inputText, userId, cmdArgs);
     if (targets.length <= 0) {
         seal.replyToSender(ctx, msg, "没有识别到要登记的钱包。\n示例：.钱包登记 QQ:123456 QQ:654321");
         return seal.ext.newCmdExecuteResult(true);
@@ -2195,7 +3038,7 @@ cmdTransfer.solve = (ctx, msg, cmdArgs) => {
         return seal.ext.newCmdExecuteResult(true);
     }
 
-    const parsed = parseTargetAndAmount(inputText, userId);
+    const parsed = parseTargetAndAmount(inputText, userId, cmdArgs);
     if (!parsed.ok) {
         seal.replyToSender(ctx, msg, parsed.reason);
         return seal.ext.newCmdExecuteResult(true);
@@ -2247,7 +3090,7 @@ cmdAdminAddMoney.solve = (ctx, msg, cmdArgs) => {
     }
 
     const senderId = getUserId(ctx, msg);
-    const parsed = parseTargetAndAmount(inputText, senderId);
+    const parsed = parseTargetAndAmount(inputText, senderId, cmdArgs);
     if (!parsed.ok) {
         seal.replyToSender(ctx, msg, parsed.reason.replace("转账", "加钱"));
         return seal.ext.newCmdExecuteResult(true);
@@ -3194,6 +4037,125 @@ function solveBlackjack(ctx, msg, cmdArgs) {
     return seal.ext.newCmdExecuteResult(true);
 }
 
+function solveRoulette(ctx, msg, cmdArgs) {
+    const parsedAction = parseRouletteAction(cmdArgs);
+    const action = parsedAction.action;
+    if (action === "help") {
+        seal.replyToSender(ctx, msg, getRouletteHelpText());
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    const userId = getUserId(ctx, msg);
+    if (!userId) {
+        replyMissingUser(ctx, msg);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    const groupId = getGroupId(ctx, msg);
+    const scopeId = getRouletteScopeId(ctx, msg, userId);
+    const playerName = getDisplayName(ctx, msg, userId);
+
+    if (groupId && resolveExpiredRouletteMultiRound(ctx, msg, groupId, "expired")) {
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    let soloRound = getRouletteSoloRound(scopeId, userId);
+    let multiRound = groupId ? getRouletteMultiRound(groupId) : null;
+
+    if (action === "soloStart") {
+        if (multiRound && findRoulettePlayer(multiRound, userId)) {
+            seal.replyToSender(ctx, msg, "你已经在本群多人轮盘中。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        startRouletteSoloRound(ctx, msg, scopeId, userId, playerName, parsedAction.rest);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "multiStart") {
+        startRouletteMultiRound(ctx, msg, groupId, userId, playerName, parsedAction.rest);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "join") {
+        joinRouletteMultiRound(ctx, msg, groupId, userId, playerName);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "start") {
+        manuallyStartRouletteMultiRound(ctx, msg, groupId, userId);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "fire") {
+        if (multiRound && multiRound.phase === "playing") {
+            const current = getRouletteCurrentPlayer(multiRound);
+            if (current && current.userId === userId) {
+                fireRouletteMultiRound(ctx, msg, groupId, userId, multiRound);
+                return seal.ext.newCmdExecuteResult(true);
+            }
+        }
+
+        if (soloRound) {
+            fireRouletteSoloRound(ctx, msg, scopeId, userId, soloRound);
+            return seal.ext.newCmdExecuteResult(true);
+        }
+
+        if (multiRound) {
+            seal.replyToSender(ctx, msg, getRouletteMultiStatusText(multiRound));
+            return seal.ext.newCmdExecuteResult(true);
+        }
+
+        seal.replyToSender(ctx, msg, "当前没有进行中的轮盘。\n使用 .轮盘 单人 50 或 .轮盘 多人 50 开局。");
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "pass") {
+        if (!soloRound) {
+            seal.replyToSender(ctx, msg, "你当前没有单人轮盘。\n使用 .轮盘 单人 50 开一局。");
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        passRouletteSoloTurn(ctx, msg, scopeId, userId, soloRound);
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "cash") {
+        seal.replyToSender(ctx, msg, "单人轮盘已改为对决模式，没有收手结算。\n安全后使用 .轮盘 换人。");
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "status") {
+        const lines = [];
+        if (soloRound) lines.push(getRouletteSoloStatusText(soloRound));
+        if (multiRound) lines.push(getRouletteMultiStatusText(multiRound));
+        if (lines.length <= 0) {
+            seal.replyToSender(ctx, msg, "当前没有进行中的轮盘。\n使用 .轮盘 help 查看说明。");
+        } else {
+            seal.replyToSender(ctx, msg, lines.join("\n\n"));
+        }
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    if (action === "end") {
+        if (multiRound && (multiRound.ownerId === userId || isEconomyAdmin(ctx))) {
+            closeRouletteMultiRound(ctx, msg, groupId, userId, multiRound);
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        if (soloRound) {
+            abandonRouletteSoloRound(ctx, msg, scopeId, userId, soloRound);
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        if (multiRound) {
+            closeRouletteMultiRound(ctx, msg, groupId, userId, multiRound);
+            return seal.ext.newCmdExecuteResult(true);
+        }
+        seal.replyToSender(ctx, msg, "当前没有可以结束的轮盘。");
+        return seal.ext.newCmdExecuteResult(true);
+    }
+
+    seal.replyToSender(ctx, msg, getRouletteHelpText());
+    return seal.ext.newCmdExecuteResult(true);
+}
+
 ext.cmdMap["低保"] = cmdDaily;
 ext.cmdMap["余额"] = cmdBalance;
 ext.cmdMap["财富榜"] = cmdWealthRank;
@@ -3223,6 +4185,12 @@ ext.cmdMap["时髦排行榜"] = cmdFashionRank;
 ext.cmdMap["买大小"] = cmdBigSmall;
 ext.cmdMap["买大"] = cmdBuyBig;
 ext.cmdMap["买小"] = cmdBuySmall;
+const cmdRoulette = seal.ext.newCmdItemInfo();
+cmdRoulette.name = "轮盘";
+cmdRoulette.help = getRouletteHelpText();
+cmdRoulette.solve = solveRoulette;
+ext.cmdMap["轮盘"] = cmdRoulette;
+ext.cmdMap["rr"] = cmdRoulette;
 const cmdBlackjack = seal.ext.newCmdItemInfo();
 cmdBlackjack.name = "21点";
 cmdBlackjack.help = getBlackjackHelpText();
