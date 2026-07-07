@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -22,6 +23,10 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent
 ASSET_DIR = ROOT / "assets"
 SAVE_DIR = ROOT / "achievements"
+STABLE_DIR = SAVE_DIR / "stables"
+HORSE_TEAM_DIR = SAVE_DIR / "horse_teams"
+RACE_GROUP_DIR = SAVE_DIR / "race_groups"
+RACE_DIR = SAVE_DIR / "races"
 TEMPLATE_PATH = ASSET_DIR / "uma_final_template_blank.png"
 MAP_PATH = ASSET_DIR / "uma_final_template_map.json"
 RANK_DIR = ASSET_DIR / "rank_badges"
@@ -69,6 +74,36 @@ STAT_LABELS = {
     "power": "力量",
     "guts": "根性",
     "wisdom": "智力",
+}
+
+TEAM_SLOTS = {
+    "upper": "上等",
+    "middle": "中等",
+    "lower": "下等",
+}
+
+SLOT_ALIASES = {
+    "upper": "upper",
+    "上等": "upper",
+    "上": "upper",
+    "上马": "upper",
+    "high": "upper",
+    "middle": "middle",
+    "中等": "middle",
+    "中": "middle",
+    "中马": "middle",
+    "mid": "middle",
+    "lower": "lower",
+    "下等": "lower",
+    "下": "lower",
+    "下马": "lower",
+    "low": "lower",
+}
+
+ORDER_CHAR_MAP = {
+    "上": "upper",
+    "中": "middle",
+    "下": "lower",
 }
 
 SKILL_DEFAULTS = {
@@ -156,7 +191,8 @@ APTITUDE_GROUPS = {
 
 
 app = Flask(__name__)
-SAVE_DIR.mkdir(exist_ok=True)
+for directory in (SAVE_DIR, STABLE_DIR, HORSE_TEAM_DIR, RACE_GROUP_DIR, RACE_DIR):
+    directory.mkdir(exist_ok=True)
 
 INVALID_XML_CHARS_RE = re.compile(
     "[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]"
@@ -741,16 +777,428 @@ def sanitize_filename(value: str) -> str:
     return safe or "调查员"
 
 
-def build_card_from_file(file_path: str) -> dict[str, Any]:
+def safe_path_key(value: str, fallback: str = "unknown") -> str:
+    safe = sanitize_filename(value)
+    safe = re.sub(r"\s+", "_", safe)
+    return safe or fallback
+
+
+def read_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_json_file(path: Path, data: Any) -> None:
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def stable_user_dir(user_key: str) -> Path:
+    path = STABLE_DIR / safe_path_key(user_key)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def stable_card_path(user_key: str, card_id: str) -> Path:
+    return stable_user_dir(user_key) / f"{safe_path_key(card_id)}.json"
+
+
+def card_summary(card: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "card_id": card.get("card_id", ""),
+        "name": card.get("name", ""),
+        "profession": card.get("profession", ""),
+        "rank": card.get("rank", ""),
+        "eval_points": card.get("eval_points", 0),
+        "stats": card.get("stats", {}),
+        "stat_ranks": card.get("stat_ranks", {}),
+        "aptitudes": card.get("aptitudes", {}),
+        "image_name": card.get("image_name", ""),
+        "created_at": card.get("created_at", ""),
+    }
+
+
+def save_stable_card(
+    user_key: str,
+    attrs: dict[str, Any],
+    result: dict[str, Any],
+    image_name: str,
+    group_id: str = "",
+    user_name: str = "",
+) -> dict[str, Any] | None:
+    if not user_key:
+        return None
+
+    card = {
+        "card_id": image_name,
+        "name": attrs["name"],
+        "profession": attrs["profession"],
+        "player": attrs.get("player", ""),
+        "rank": result["rank"],
+        "eval_points": result["eval_points"],
+        "stats": result["stats"],
+        "stat_ranks": result["stat_ranks"],
+        "aptitudes": {key: value["grade"] for key, value in result["aptitudes"].items()},
+        "image_name": image_name,
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    write_json_file(stable_card_path(user_key, image_name), card)
+    if group_id:
+        register_group_user(group_id, user_key, user_name)
+    return card
+
+
+def load_stable_cards(user_key: str) -> list[dict[str, Any]]:
+    path = stable_user_dir(user_key)
+    cards = []
+    for item in path.glob("*.json"):
+        data = read_json_file(item, None)
+        if isinstance(data, dict) and data.get("card_id"):
+            cards.append(data)
+    cards.sort(key=lambda card: (card.get("created_at", ""), card.get("card_id", "")), reverse=True)
+    return cards
+
+
+def find_stable_card(user_key: str, query: str) -> dict[str, Any] | None:
+    query = str(query or "").strip()
+    if not query:
+        return None
+
+    cards = load_stable_cards(user_key)
+    for card in cards:
+        if query == card.get("card_id") or query == card.get("name"):
+            return card
+
+    matches = [
+        card for card in cards
+        if query in str(card.get("name", "")) or query in str(card.get("card_id", ""))
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return {"__ambiguous__": [card.get("name", card.get("card_id", "")) for card in matches]}
+    return None
+
+
+def remove_stable_card(user_key: str, query: str) -> tuple[dict[str, Any] | None, str]:
+    card = find_stable_card(user_key, query)
+    if not card:
+        return None, "没有找到这张马卡。"
+    if "__ambiguous__" in card:
+        names = "、".join(card["__ambiguous__"][:6])
+        return None, f"找到多张同名马卡：{names}。请换更完整的名字。"
+
+    path = stable_card_path(user_key, card["card_id"])
+    if path.exists():
+        path.unlink()
+
+    team = load_horse_team(user_key)
+    changed = False
+    for slot, card_id in list(team.items()):
+        if card_id == card["card_id"]:
+            team[slot] = ""
+            changed = True
+    if changed:
+        save_horse_team(user_key, team)
+    return card, f"{card['name']} 已从马房删除。"
+
+
+def horse_team_path(user_key: str) -> Path:
+    return HORSE_TEAM_DIR / f"{safe_path_key(user_key)}.json"
+
+
+def load_horse_team(user_key: str) -> dict[str, str]:
+    data = read_json_file(horse_team_path(user_key), {})
+    team = {slot: str(data.get(slot) or "") for slot in TEAM_SLOTS}
+    return team
+
+
+def save_horse_team(user_key: str, team: dict[str, str]) -> None:
+    payload = {slot: team.get(slot, "") for slot in TEAM_SLOTS}
+    payload["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    write_json_file(horse_team_path(user_key), payload)
+
+
+def slot_from_text(value: str) -> str | None:
+    return SLOT_ALIASES.get(str(value or "").strip().lower()) or SLOT_ALIASES.get(str(value or "").strip())
+
+
+def parse_order(value: str) -> list[str] | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    compact = re.sub(r"[\s,，、/|]+", "", raw)
+    if len(compact) == 3 and all(char in ORDER_CHAR_MAP for char in compact):
+        order = [ORDER_CHAR_MAP[char] for char in compact]
+        return order if len(set(order)) == 3 else None
+
+    tokens = [token for token in re.split(r"[\s,，、/|]+", raw) if token]
+    order = [slot_from_text(token) for token in tokens]
+    if len(order) == 3 and all(order) and len(set(order)) == 3:
+        return [str(slot) for slot in order]
+    return None
+
+
+def team_detail(user_key: str) -> dict[str, Any]:
+    team = load_horse_team(user_key)
+    cards = {card["card_id"]: card for card in load_stable_cards(user_key)}
+    slots = {}
+    for slot, label in TEAM_SLOTS.items():
+        card_id = team.get(slot, "")
+        slots[slot] = {
+            "label": label,
+            "card_id": card_id,
+            "card": card_summary(cards[card_id]) if card_id in cards else None,
+        }
+    return {"slots": slots, "complete": all(item["card"] for item in slots.values())}
+
+
+def complete_team_cards(user_key: str) -> dict[str, dict[str, Any]] | None:
+    detail = team_detail(user_key)
+    if not detail["complete"]:
+        return None
+    return {slot: detail["slots"][slot]["card"] for slot in TEAM_SLOTS}
+
+
+def group_path(group_id: str) -> Path:
+    return RACE_GROUP_DIR / f"{safe_path_key(group_id)}.json"
+
+
+def register_group_user(group_id: str, user_key: str, user_name: str = "") -> None:
+    if not group_id or not user_key:
+        return
+    data = read_json_file(group_path(group_id), {"group_id": group_id, "users": {}})
+    users = data.setdefault("users", {})
+    users[user_key] = {
+        "name": user_name or users.get(user_key, {}).get("name") or f"玩家{user_key}",
+        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    data["group_id"] = group_id
+    write_json_file(group_path(group_id), data)
+
+
+def choose_opponent(group_id: str, user_key: str, rng: random.Random) -> tuple[str, str] | None:
+    data = read_json_file(group_path(group_id), {"users": {}})
+    candidates = []
+    own_power = team_power(user_key)
+    for candidate_key, info in data.get("users", {}).items():
+        if candidate_key == user_key:
+            continue
+        if complete_team_cards(candidate_key):
+            gap = abs(team_power(candidate_key) - own_power)
+            candidates.append((gap, rng.random(), candidate_key, info.get("name") or f"玩家{candidate_key}"))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2], candidates[0][3]
+
+
+def team_power(user_key: str) -> int:
+    cards = complete_team_cards(user_key)
+    if not cards:
+        return 0
+    return sum(int(card.get("eval_points", 0)) for card in cards.values())
+
+
+def performance_score(card: dict[str, Any], rng: random.Random) -> float:
+    stats = card.get("stats", {})
+    speed = int(stats.get("speed", 0))
+    stamina = int(stats.get("stamina", 0))
+    power = int(stats.get("power", 0))
+    guts = int(stats.get("guts", 0))
+    wisdom = int(stats.get("wisdom", 0))
+    base = speed * 0.34 + stamina * 0.20 + power * 0.22 + guts * 0.14 + wisdom * 0.10
+    spread = max(12.0, 170.0 - wisdom * 0.09 - stamina * 0.04)
+    score = base + rng.uniform(-spread, spread)
+    if score < base:
+        score += min(base - score, guts * 0.08)
+    return round(score, 1)
+
+
+def run_race(
+    user_key: str,
+    group_id: str,
+    order_text: str,
+    *,
+    user_name: str = "",
+    opponent_key: str = "",
+    opponent_name: str = "",
+    seed: str = "",
+) -> dict[str, Any]:
+    order = parse_order(order_text)
+    if not order:
+        return {"status": "error", "msg": "出场顺序需要包含上、中、下三项，例如 上中下 或 下 上 中"}
+
+    own_cards = complete_team_cards(user_key)
+    if not own_cards:
+        return {"status": "error", "msg": "你的马队还没有设置完整。请先设置上等马、中等马、下等马。"}
+
+    rng = random.Random(seed) if seed else random.Random()
+    if group_id:
+        register_group_user(group_id, user_key, user_name)
+
+    if opponent_key:
+        if opponent_key == user_key:
+            return {"status": "error", "msg": "不能挑战自己。"}
+        opponent_cards = complete_team_cards(opponent_key)
+        if not opponent_cards:
+            return {"status": "error", "msg": "对手马队还没有设置完整。"}
+        opponent_label = opponent_name or f"玩家{opponent_key}"
+    else:
+        picked = choose_opponent(group_id, user_key, rng)
+        if not picked:
+            return {"status": "error", "msg": "当前群没有可自动匹配的完整马队。"}
+        opponent_key, opponent_label = picked
+        opponent_cards = complete_team_cards(opponent_key)
+
+    if not opponent_cards:
+        return {"status": "error", "msg": "对手马队还没有设置完整。"}
+
+    opponent_order = list(TEAM_SLOTS)
+    rng.shuffle(opponent_order)
+
+    own_wins = 0
+    opponent_wins = 0
+    rounds = []
+    round_names = ("第一场", "第二场", "第三场")
+    for index, (own_slot, opponent_slot) in enumerate(zip(order, opponent_order)):
+        own_card = own_cards[own_slot]
+        opponent_card = opponent_cards[opponent_slot]
+        own_score = performance_score(own_card, rng)
+        opponent_score = performance_score(opponent_card, rng)
+        if round(own_score) > round(opponent_score):
+            winner = "user"
+        elif round(opponent_score) > round(own_score):
+            winner = "opponent"
+        elif int(own_card.get("eval_points", 0)) > int(opponent_card.get("eval_points", 0)):
+            winner = "user"
+        elif int(opponent_card.get("eval_points", 0)) > int(own_card.get("eval_points", 0)):
+            winner = "opponent"
+        else:
+            winner = "user" if rng.random() >= 0.5 else "opponent"
+
+        if winner == "user":
+            own_wins += 1
+            winner_name = own_card["name"]
+        else:
+            opponent_wins += 1
+            winner_name = opponent_card["name"]
+
+        rounds.append({
+            "round": index + 1,
+            "round_name": round_names[index],
+            "user_slot": own_slot,
+            "opponent_slot": opponent_slot,
+            "user_horse": own_card,
+            "opponent_horse": opponent_card,
+            "user_score": own_score,
+            "opponent_score": opponent_score,
+            "winner": winner,
+            "winner_name": winner_name,
+            "text": f"{round_names[index]}：{own_card['name']} 对 {opponent_card['name']}。{winner_name} 先过线。",
+        })
+
+    winner_side = "user" if own_wins > opponent_wins else "opponent"
+    race_id = f"race_{safe_path_key(user_key)}_{safe_path_key(opponent_key)}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    race = {
+        "id": race_id,
+        "user_key": user_key,
+        "user_name": user_name or f"玩家{user_key}",
+        "opponent_key": opponent_key,
+        "opponent_name": opponent_label,
+        "order": order,
+        "opponent_order": opponent_order,
+        "score": f"{own_wins}:{opponent_wins}",
+        "winner": "",
+        "winner_side": winner_side,
+        "rounds": rounds,
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    race["winner"] = race["user_name"] if winner_side == "user" else race["opponent_name"]
+    race["img"] = render_race_result(race)
+    write_json_file(RACE_DIR / f"{race_id}.json", race)
+    return {
+        "status": "ok",
+        "msg": f"{race['winner']}赢下马赛。",
+        "race_id": race_id,
+        "img": race["img"],
+        "score": race["score"],
+        "winner": race["winner"],
+        "opponent_key": opponent_key,
+        "opponent_name": race["opponent_name"],
+        "rounds": [
+            {
+                "round": item["round"],
+                "text": item["text"],
+                "user_score": item["user_score"],
+                "opponent_score": item["opponent_score"],
+                "winner": item["winner"],
+            }
+            for item in rounds
+        ],
+    }
+
+
+def render_race_result(race: dict[str, Any]) -> str:
+    width, height = 1180, 760
+    image = Image.new("RGB", (width, height), (249, 244, 235))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((0, 0, width, 118), fill=(132, 44, 38))
+    draw.rectangle((0, 118, width, 128), fill=(216, 161, 64))
+    draw.text((48, 34), "马赛结果", font=get_font(48), fill=WHITE)
+    draw.text((48, 92), f"{race['user_name']}  {race['score']}  {race['opponent_name']}", font=get_font(26), fill=(255, 242, 210))
+    draw.text((900, 45), f"胜者：{race['winner']}", font=get_font(32), fill=WHITE)
+
+    y = 164
+    for item in race["rounds"]:
+        fill = (255, 255, 255) if item["round"] % 2 else (244, 237, 224)
+        draw.rounded_rectangle((44, y, width - 44, y + 142), radius=18, fill=fill, outline=(218, 197, 164), width=3)
+        draw.text((72, y + 22), item["round_name"], font=get_font(31), fill=(103, 45, 0))
+        draw.text(
+            (72, y + 76),
+            f"{TEAM_SLOTS[item['user_slot']]}：{item['user_horse']['name']}  {item['user_score']}",
+            font=get_font(27),
+            fill=(46, 82, 126),
+        )
+        draw.text(
+            (520, y + 76),
+            f"{TEAM_SLOTS[item['opponent_slot']]}：{item['opponent_horse']['name']}  {item['opponent_score']}",
+            font=get_font(27),
+            fill=(122, 57, 49),
+        )
+        draw.text((920, y + 74), f"{item['winner_name']}胜", font=get_font(30), fill=(146, 88, 12))
+        y += 168
+
+    image_name = race["id"]
+    output = SAVE_DIR / f"{image_name}.png"
+    image.save(output)
+    return image_name
+
+
+def build_card_from_file(
+    file_path: str,
+    *,
+    user_key: str = "",
+    group_id: str = "",
+    user_name: str = "",
+) -> dict[str, Any]:
     attrs = parse_coc_excel(file_path)
     result = calculate_uma(attrs)
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     title = f"{sanitize_filename(attrs['name'])}_uma_{timestamp}"
     output = SAVE_DIR / f"{title}.png"
     render_uma_card(attrs, result, output)
+    stable_card = save_stable_card(user_key, attrs, result, title, group_id, user_name)
     return {
         "status": "ok",
         "name": title,
+        "card_id": stable_card["card_id"] if stable_card else "",
+        "stable_saved": bool(stable_card),
         "character": attrs["name"],
         "profession": attrs["profession"],
         "eval_points": result["eval_points"],
@@ -777,10 +1225,119 @@ def excel_suffix_from_name(value: str) -> str:
     return ".xlsx"
 
 
+def request_payload() -> dict[str, Any]:
+    payload = request.get_json(silent=True) or {}
+    if request.form:
+        payload.update(request.form.to_dict())
+    payload.update(request.args.to_dict())
+    return payload
+
+
+@app.route("/stable/list", methods=["GET", "POST"])
+def stable_list():
+    payload = request_payload()
+    user_key = str(payload.get("user_key") or "").strip()
+    if not user_key:
+        return jsonify({"status": "error", "msg": "缺少 user_key"})
+    cards = [card_summary(card) for card in load_stable_cards(user_key)]
+    return jsonify({"status": "ok", "cards": cards, "count": len(cards)})
+
+
+@app.route("/stable/detail", methods=["GET", "POST"])
+def stable_detail():
+    payload = request_payload()
+    user_key = str(payload.get("user_key") or "").strip()
+    query = str(payload.get("name") or payload.get("card_id") or "").strip()
+    if not user_key or not query:
+        return jsonify({"status": "error", "msg": "缺少 user_key 或 name"})
+    card = find_stable_card(user_key, query)
+    if not card:
+        return jsonify({"status": "error", "msg": "没有找到这张马卡。"})
+    if "__ambiguous__" in card:
+        names = "、".join(card["__ambiguous__"][:6])
+        return jsonify({"status": "error", "msg": f"找到多张同名马卡：{names}。请换更完整的名字。"})
+    return jsonify({"status": "ok", "card": card_summary(card)})
+
+
+@app.route("/stable/remove", methods=["GET", "POST"])
+def stable_remove():
+    payload = request_payload()
+    user_key = str(payload.get("user_key") or "").strip()
+    query = str(payload.get("name") or payload.get("card_id") or "").strip()
+    if not user_key or not query:
+        return jsonify({"status": "error", "msg": "缺少 user_key 或 name"})
+    card, msg = remove_stable_card(user_key, query)
+    if not card:
+        return jsonify({"status": "error", "msg": msg})
+    return jsonify({"status": "ok", "msg": msg, "card": card_summary(card), "team": team_detail(user_key)})
+
+
+@app.route("/horse_team/set", methods=["GET", "POST"])
+def horse_team_set():
+    payload = request_payload()
+    user_key = str(payload.get("user_key") or "").strip()
+    slot = slot_from_text(str(payload.get("slot") or ""))
+    query = str(payload.get("name") or payload.get("card_id") or "").strip()
+    group_id = str(payload.get("group_id") or "").strip()
+    user_name = str(payload.get("user_name") or "").strip()
+    if not user_key or not slot or not query:
+        return jsonify({"status": "error", "msg": "缺少 user_key、slot 或 name"})
+    card = find_stable_card(user_key, query)
+    if not card:
+        return jsonify({"status": "error", "msg": "没有找到这张马卡。"})
+    if "__ambiguous__" in card:
+        names = "、".join(card["__ambiguous__"][:6])
+        return jsonify({"status": "error", "msg": f"找到多张同名马卡：{names}。请换更完整的名字。"})
+    team = load_horse_team(user_key)
+    team[slot] = card["card_id"]
+    save_horse_team(user_key, team)
+    if group_id:
+        register_group_user(group_id, user_key, user_name)
+    return jsonify({
+        "status": "ok",
+        "msg": f"{card['name']} 已设为{TEAM_SLOTS[slot]}马。",
+        "team": team_detail(user_key),
+    })
+
+
+@app.route("/horse_team/list", methods=["GET", "POST"])
+def horse_team_list():
+    payload = request_payload()
+    user_key = str(payload.get("user_key") or "").strip()
+    group_id = str(payload.get("group_id") or "").strip()
+    user_name = str(payload.get("user_name") or "").strip()
+    if not user_key:
+        return jsonify({"status": "error", "msg": "缺少 user_key"})
+    if group_id:
+        register_group_user(group_id, user_key, user_name)
+    return jsonify({"status": "ok", "team": team_detail(user_key)})
+
+
+@app.route("/race/run", methods=["GET", "POST"])
+def race_run():
+    payload = request_payload()
+    user_key = str(payload.get("user_key") or "").strip()
+    group_id = str(payload.get("group_id") or "").strip()
+    order = str(payload.get("order") or "").strip()
+    if not user_key or not group_id or not order:
+        return jsonify({"status": "error", "msg": "缺少 user_key、group_id 或 order"})
+    result = run_race(
+        user_key,
+        group_id,
+        order,
+        user_name=str(payload.get("user_name") or "").strip(),
+        opponent_key=str(payload.get("opponent_key") or "").strip(),
+        opponent_name=str(payload.get("opponent_name") or "").strip(),
+        seed=str(payload.get("seed") or "").strip(),
+    )
+    return jsonify(result)
+
+
 @app.route("/generate_uma", methods=["GET", "POST"])
 def generate_uma():
     temp_path = None
     try:
+        payload = request_payload()
         if request.method == "POST" and "file" in request.files:
             uploaded = request.files["file"]
             suffix = Path(uploaded.filename or "card.xlsx").suffix or ".xlsx"
@@ -793,7 +1350,12 @@ def generate_uma():
                 return jsonify({"status": "error", "msg": "缺少 url 或上传文件"})
             temp_path = download_excel_to_temp(url, excel_suffix_from_name(url))
 
-        return jsonify(build_card_from_file(temp_path))
+        return jsonify(build_card_from_file(
+            temp_path,
+            user_key=str(payload.get("user_key") or "").strip(),
+            group_id=str(payload.get("group_id") or "").strip(),
+            user_name=str(payload.get("user_name") or "").strip(),
+        ))
     except Exception as exc:
         return jsonify({"status": "error", "msg": str(exc)})
     finally:
@@ -825,7 +1387,12 @@ def generate_uma_group_file():
             return jsonify({"status": "error", "msg": f"获取文件下载链接失败：{api_json.get('message') or api_json}"})
 
         temp_path = download_excel_to_temp(download_url, excel_suffix_from_name(filename))
-        return jsonify(build_card_from_file(temp_path))
+        return jsonify(build_card_from_file(
+            temp_path,
+            user_key=str(payload.get("user_key") or request.args.get("user_key") or "").strip(),
+            group_id=str(payload.get("race_group_id") or payload.get("group_id") or request.args.get("race_group_id") or group_id or "").strip(),
+            user_name=str(payload.get("user_name") or request.args.get("user_name") or "").strip(),
+        ))
     except Exception as exc:
         return jsonify({"status": "error", "msg": str(exc)})
     finally:

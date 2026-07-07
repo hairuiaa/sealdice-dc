@@ -16,12 +16,110 @@ if (!ext) {
 seal.ext.registerStringConfig(ext, 'OneBot_API_地址', 'http://luckylillia:3010/api', 'llbot/Milky 的 HTTP 监听地址，末尾不要带斜杠');
 seal.ext.registerStringConfig(ext, '赛马娘转换后端', 'http://coc-uma-card:21999', 'uma_musume.py 的服务地址。Docker 部署时推荐把后端放进 sealdice-ai_sealnet 网络。');
 
+const HORSE_TEAM_SLOT_ALIASES = {
+  上等: 'upper',
+  上: 'upper',
+  上马: 'upper',
+  upper: 'upper',
+  中等: 'middle',
+  中: 'middle',
+  中马: 'middle',
+  middle: 'middle',
+  下等: 'lower',
+  下: 'lower',
+  下马: 'lower',
+  lower: 'lower',
+};
+
+const HORSE_TEAM_SLOT_LABELS = {
+  upper: '上等',
+  middle: '中等',
+  lower: '下等',
+};
+
+const APTITUDE_LABELS = {
+  melee: '近战',
+  ranged: '远程',
+  city: '城市',
+  wild: '野外',
+  library: '文献',
+  data: '资料',
+  endurance: '耐久',
+  emergency: '应急',
+  mental: '精神',
+  luck: '运气',
+};
+
 function normalizeGroupId(groupId) {
   if (!groupId) return '';
   const value = String(groupId);
   if (value.includes('Group')) return value;
   if (/^\d+$/.test(value)) return `QQ-Group:${value}`;
   return value;
+}
+
+function plainGroupId(ctx) {
+  const groupId = normalizeGroupId(ctx.group && ctx.group.groupId);
+  return groupId.replace('QQ-Group:', '');
+}
+
+function playerKey(ctx) {
+  return ctx.player && ctx.player.userId ? ctx.player.userId.replace(/^QQ:/, '') : '';
+}
+
+function playerName(ctx) {
+  return (ctx.player && ctx.player.name) || `玩家${playerKey(ctx)}`;
+}
+
+function backendBase() {
+  let backendUrl = seal.ext.getStringConfig(ext, '赛马娘转换后端');
+  if (backendUrl.endsWith('/')) backendUrl = backendUrl.slice(0, -1);
+  return backendUrl;
+}
+
+function buildQuery(params) {
+  const parts = [];
+  Object.keys(params).forEach((key) => {
+    const value = params[key];
+    if (value === undefined || value === null || value === '') return;
+    parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  });
+  return parts.join('&');
+}
+
+async function backendGet(path, params) {
+  const url = `${backendBase()}${path}?${buildQuery(params)}`;
+  const resp = await fetch(url);
+  return readJsonResponse(resp, '赛马娘马赛后端');
+}
+
+function collectArgs(cmdArgs, startIndex) {
+  const rest = [];
+  for (let i = startIndex; i <= cmdArgs.args.length; i++) {
+    const item = cmdArgs.getArgN(i);
+    if (item) rest.push(item);
+  }
+  return rest;
+}
+
+function extractAtQQ(msg) {
+  const match = msg && msg.message ? msg.message.match(/\[CQ:at,qq=(\d+)\]/) : null;
+  return match ? match[1] : '';
+}
+
+function formatCardLine(card, index) {
+  const prefix = index ? `${index}. ` : '';
+  return `${prefix}${card.name}｜${card.rank} ${card.eval_points}｜速${card.stats.speed} 耐${card.stats.stamina} 力${card.stats.power} 根${card.stats.guts} 智${card.stats.wisdom}`;
+}
+
+function formatTeamSlots(team) {
+  const slots = team && team.slots ? team.slots : {};
+  return ['upper', 'middle', 'lower'].map((slot) => {
+    const item = slots[slot] || {};
+    const card = item.card;
+    if (!card) return `${HORSE_TEAM_SLOT_LABELS[slot]}：未设置`;
+    return `${HORSE_TEAM_SLOT_LABELS[slot]}：${card.name}｜${card.rank} ${card.eval_points}`;
+  }).join('\n');
 }
 
 function saveCocExcelFile(ctx, msg, file) {
@@ -202,18 +300,20 @@ cmdUma.solve = async (ctx, msg, cmdArgs) => {
   seal.replyToSender(ctx, msg, `正在转换【${fileData.name}】，请稍候。`);
 
   try {
+    const commonParams = `user_key=${encodeURIComponent(playerId)}&group_id=${encodeURIComponent(onebotGroupId)}&user_name=${encodeURIComponent(playerName(ctx))}`;
     const endpoint = fileData.url
-      ? `${backendUrl}/generate_uma?url=${encodeURIComponent(fileData.url)}`
-      : `${backendUrl}/generate_uma_group_file?api_base=${encodeURIComponent(onebotApiUrl)}&group_id=${encodeURIComponent(onebotGroupId)}&file_id=${encodeURIComponent(fileData.file_id)}&filename=${encodeURIComponent(fileData.name)}`;
+      ? `${backendUrl}/generate_uma?url=${encodeURIComponent(fileData.url)}&${commonParams}`
+      : `${backendUrl}/generate_uma_group_file?api_base=${encodeURIComponent(onebotApiUrl)}&group_id=${encodeURIComponent(onebotGroupId)}&file_id=${encodeURIComponent(fileData.file_id)}&filename=${encodeURIComponent(fileData.name)}&${commonParams}`;
     const resp = await fetch(endpoint);
     const resJson = await readJsonResponse(resp, '赛马娘转换后端');
 
     if (resJson.status === 'ok') {
       const imgUrl = `${backendUrl}/get_img?title=${encodeURIComponent(resJson.name)}&t=${new Date().getTime()}`;
+      const stableText = resJson.stable_saved ? '\n已加入马房。' : '';
       seal.replyToSender(
         ctx,
         msg,
-        `转换完成。\n角色：${resJson.character}\n总评：${resJson.rank} / ${resJson.eval_points}\n[CQ:image,file=${imgUrl},cache=0]`,
+        `转换完成。\n角色：${resJson.character}\n总评：${resJson.rank} / ${resJson.eval_points}${stableText}\n[CQ:image,file=${imgUrl},cache=0]`,
       );
       ext.storageSet(`coc_last_excel_${groupId}`, '');
     } else {
@@ -230,3 +330,172 @@ cmdUma.solve = async (ctx, msg, cmdArgs) => {
 ext.cmdMap['赛马娘'] = cmdUma;
 ext.cmdMap['uma'] = cmdUma;
 ext.cmdMap['coc赛马娘'] = cmdUma;
+
+const cmdStable = seal.ext.newCmdItemInfo();
+cmdStable.name = '马房';
+cmdStable.help = `马房：
+.马房 列表
+.马房 详情 <卡名>
+.马房 删除 <卡名>`;
+
+cmdStable.solve = async (ctx, msg, cmdArgs) => {
+  const userKey = playerKey(ctx);
+  const sub = (cmdArgs.getArgN(1) || '列表').toLowerCase();
+  const rest = collectArgs(cmdArgs, 2);
+  try {
+    if (sub === '列表' || sub === 'list') {
+      const result = await backendGet('/stable/list', { user_key: userKey });
+      if (result.status !== 'ok') {
+        seal.replyToSender(ctx, msg, `失败：${result.msg}`);
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      if (!result.cards.length) {
+        seal.replyToSender(ctx, msg, '马房里还没有马。先用 .赛马娘 生成。');
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      const lines = result.cards.slice(0, 12).map((card, index) => formatCardLine(card, index + 1));
+      seal.replyToSender(ctx, msg, `马房共有 ${result.count} 张卡。\n${lines.join('\n')}`);
+    } else if (sub === '详情' || sub === 'detail') {
+      const name = rest.join(' ').trim();
+      if (!name) {
+        seal.replyToSender(ctx, msg, '用法：.马房 详情 <卡名>');
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      const result = await backendGet('/stable/detail', { user_key: userKey, name });
+      if (result.status !== 'ok') {
+        seal.replyToSender(ctx, msg, `失败：${result.msg}`);
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      const card = result.card;
+      const aptitudes = Object.keys(card.aptitudes || {}).map((key) => `${APTITUDE_LABELS[key] || key}:${card.aptitudes[key]}`).join(' ');
+      seal.replyToSender(ctx, msg, `${formatCardLine(card)}\n适性：${aptitudes || '无'}`);
+    } else if (sub === '删除' || sub === '移除' || sub === 'remove' || sub === 'delete') {
+      const name = rest.join(' ').trim();
+      if (!name) {
+        seal.replyToSender(ctx, msg, '用法：.马房 删除 <卡名>');
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      const result = await backendGet('/stable/remove', { user_key: userKey, name });
+      seal.replyToSender(ctx, msg, result.status === 'ok' ? result.msg : `失败：${result.msg}`);
+    } else {
+      seal.replyToSender(ctx, msg, cmdStable.help);
+    }
+  } catch (e) {
+    seal.replyToSender(ctx, msg, `马房错误：${e.message}`);
+  }
+  return seal.ext.newCmdExecuteResult(true);
+};
+
+ext.cmdMap['马房'] = cmdStable;
+
+const cmdHorseTeam = seal.ext.newCmdItemInfo();
+cmdHorseTeam.name = '马队';
+cmdHorseTeam.help = `马队：
+.马队 设置 上等 <卡名>
+.马队 设置 中等 <卡名>
+.马队 设置 下等 <卡名>
+.马队 列表`;
+
+cmdHorseTeam.solve = async (ctx, msg, cmdArgs) => {
+  const userKey = playerKey(ctx);
+  const sub = (cmdArgs.getArgN(1) || '列表').toLowerCase();
+  const groupId = plainGroupId(ctx);
+  try {
+    if (sub === '列表' || sub === 'list') {
+      const result = await backendGet('/horse_team/list', {
+        user_key: userKey,
+        group_id: groupId,
+        user_name: playerName(ctx),
+      });
+      if (result.status !== 'ok') {
+        seal.replyToSender(ctx, msg, `失败：${result.msg}`);
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      seal.replyToSender(ctx, msg, `当前马队：\n${formatTeamSlots(result.team)}`);
+    } else if (sub === '设置' || sub === 'set') {
+      const slotRaw = cmdArgs.getArgN(2) || '';
+      const slot = HORSE_TEAM_SLOT_ALIASES[slotRaw] || HORSE_TEAM_SLOT_ALIASES[slotRaw.toLowerCase()];
+      const name = collectArgs(cmdArgs, 3).join(' ').trim();
+      if (!slot || !name) {
+        seal.replyToSender(ctx, msg, '用法：.马队 设置 上等 <卡名>');
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      const result = await backendGet('/horse_team/set', {
+        user_key: userKey,
+        group_id: groupId,
+        user_name: playerName(ctx),
+        slot,
+        name,
+      });
+      if (result.status !== 'ok') {
+        seal.replyToSender(ctx, msg, `失败：${result.msg}`);
+        return seal.ext.newCmdExecuteResult(true);
+      }
+      seal.replyToSender(ctx, msg, `${result.msg}\n${formatTeamSlots(result.team)}`);
+    } else {
+      seal.replyToSender(ctx, msg, cmdHorseTeam.help);
+    }
+  } catch (e) {
+    seal.replyToSender(ctx, msg, `马队错误：${e.message}`);
+  }
+  return seal.ext.newCmdExecuteResult(true);
+};
+
+ext.cmdMap['马队'] = cmdHorseTeam;
+
+const cmdRace = seal.ext.newCmdItemInfo();
+cmdRace.name = '马赛';
+cmdRace.help = `马赛：
+.马赛 出战 上中下
+.马赛 出战 下 上 中
+.马赛 出战 下上中 @对方`;
+
+cmdRace.solve = async (ctx, msg, cmdArgs) => {
+  const groupId = plainGroupId(ctx);
+  if (!groupId) {
+    seal.replyToSender(ctx, msg, '马赛仅限群聊使用。');
+    return seal.ext.newCmdExecuteResult(true);
+  }
+
+  const sub = (cmdArgs.getArgN(1) || '').toLowerCase();
+  if (sub !== '出战' && sub !== 'run') {
+    seal.replyToSender(ctx, msg, cmdRace.help);
+    return seal.ext.newCmdExecuteResult(true);
+  }
+
+  const orderParts = collectArgs(cmdArgs, 2).filter((item) => !item.includes('[CQ:at,'));
+  const order = orderParts.join('');
+  const opponentKey = extractAtQQ(msg);
+  if (!order) {
+    seal.replyToSender(ctx, msg, '用法：.马赛 出战 上中下');
+    return seal.ext.newCmdExecuteResult(true);
+  }
+
+  try {
+    seal.replyToSender(ctx, msg, '马赛开跑，请稍候。');
+    const result = await backendGet('/race/run', {
+      user_key: playerKey(ctx),
+      group_id: groupId,
+      user_name: playerName(ctx),
+      order,
+      opponent_key: opponentKey,
+      opponent_name: opponentKey ? `玩家${opponentKey}` : '',
+    });
+    if (result.status !== 'ok') {
+      seal.replyToSender(ctx, msg, `失败：${result.msg}`);
+      return seal.ext.newCmdExecuteResult(true);
+    }
+    const lines = (result.rounds || []).map((item) => item.text).join('\n');
+    const imgUrl = `${backendBase()}/get_img?title=${encodeURIComponent(result.img)}&t=${Date.now()}`;
+    seal.replyToSender(
+      ctx,
+      msg,
+      `马赛结束。\n比分：${result.score}\n胜者：${result.winner}\n对手：${result.opponent_name}\n${lines}\n[CQ:image,file=${imgUrl},cache=0]`,
+    );
+  } catch (e) {
+    seal.replyToSender(ctx, msg, `马赛错误：${e.message}`);
+  }
+  return seal.ext.newCmdExecuteResult(true);
+};
+
+ext.cmdMap['马赛'] = cmdRace;
